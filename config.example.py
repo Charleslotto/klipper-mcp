@@ -13,6 +13,11 @@ import os
 # URL to your Moonraker instance (usually localhost if running on same machine)
 MOONRAKER_URL = os.getenv("MOONRAKER_URL", "http://localhost:7125")
 
+# Timeout (seconds) for requests to Moonraker. Some operations (homing, bed mesh
+# calibration, quad gantry level, tool changes, plugin updates) legitimately take
+# longer than a typical HTTP request timeout.
+MOONRAKER_TIMEOUT_SECONDS = int(os.getenv("MOONRAKER_TIMEOUT_SECONDS", "120"))
+
 # Display name for your printer
 PRINTER_NAME = "Voron"
 
