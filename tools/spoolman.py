@@ -3,6 +3,7 @@ Spoolman Integration Tools
 Filament spool tracking and management
 """
 import json
+import asyncio
 from typing import Optional
 import aiohttp
 import config
@@ -10,21 +11,40 @@ import config
 
 def register_spoolman_tools(mcp):
     """Register Spoolman tools."""
-    
+
+    # Lazily-created, reused session (mirrors MoonrakerClient._get_session) so
+    # we don't pay a fresh TCP/TLS handshake on every Spoolman call.
+    _session_holder = {"session": None}
+    _session_lock = asyncio.Lock()
+
+    async def _get_spoolman_session() -> aiohttp.ClientSession:
+        async with _session_lock:
+            session = _session_holder["session"]
+            if session is None or session.closed:
+                session = aiohttp.ClientSession()
+                _session_holder["session"] = session
+            return session
+
+    async def close_spoolman_session():
+        """Close the shared Spoolman session, if open."""
+        session = _session_holder["session"]
+        if session and not session.closed:
+            await session.close()
+
     async def spoolman_request(method: str, endpoint: str, json_data: dict = None):
         """Make request to Spoolman API."""
         if not config.SPOOLMAN_ENABLED:
             return {"error": "Spoolman not enabled. Set SPOOLMAN_ENABLED=true"}
-        
+
         url = f"{config.SPOOLMAN_URL}/api/v1{endpoint}"
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.request(method, url, json=json_data) as response:
-                    if response.status == 404:
-                        return {"error": f"Spoolman endpoint not found: {endpoint}"}
-                    response.raise_for_status()
-                    return await response.json()
+            session = await _get_spoolman_session()
+            async with session.request(method, url, json=json_data) as response:
+                if response.status == 404:
+                    return {"error": f"Spoolman endpoint not found: {endpoint}"}
+                response.raise_for_status()
+                return await response.json()
         except aiohttp.ClientError as e:
             return {"error": f"Spoolman connection error: {str(e)}"}
     
@@ -118,31 +138,40 @@ def register_spoolman_tools(mcp):
     async def get_active_spool() -> str:
         """Get the currently active spool (if set via Moonraker-Spoolman integration)."""
         from moonraker import get_client
-        
+
         client = get_client()
-        
-        # Query Moonraker for active spool (if spoolman integration is configured)
-        result = await client.query_printer_objects({
-            "spoolman": ["spool_id", "filament_name", "filament_used"]
-        })
-        
+
+        # Spoolman is a Moonraker *component*, not a Klipper printer object, so
+        # query it via the dedicated endpoint rather than query_printer_objects.
+        result = await client.get_spool_id()
+
         if "error" in result:
-            # Spoolman object may not exist in Moonraker
+            # Spoolman component may not be configured in Moonraker
             return json.dumps({
                 "message": "Spoolman integration not configured in Moonraker",
                 "hint": "Add [spoolman] section to moonraker.conf"
             })
-        
-        status = result.get("result", {}).get("status", {})
-        spoolman = status.get("spoolman", {})
-        
-        if not spoolman or not spoolman.get("spool_id"):
+
+        spool_id = result.get("result", {}).get("spool_id")
+
+        if not spool_id:
             return json.dumps({"active_spool": None, "message": "No spool currently active"})
-        
+
+        # Fetch full spool details from Spoolman itself now that we have the ID
+        spool = await spoolman_request("GET", f"/spool/{spool_id}")
+
+        if "error" in spool:
+            return json.dumps({"spool_id": spool_id, "error": spool["error"]})
+
+        filament = spool.get("filament", {})
+
         return json.dumps({
-            "spool_id": spoolman.get("spool_id"),
-            "filament_name": spoolman.get("filament_name"),
-            "filament_used_mm": spoolman.get("filament_used"),
+            "spool_id": spool_id,
+            "filament_name": filament.get("name"),
+            "material": filament.get("material"),
+            "color": filament.get("color_hex"),
+            "remaining_weight_g": spool.get("remaining_weight"),
+            "used_weight_g": spool.get("used_weight"),
         }, indent=2)
     
     @mcp.tool()
