@@ -87,7 +87,7 @@ def register_toolchanger_tools(mcp):
         # Query all tool objects
         objects = {}
         for i in range(config.TOOL_COUNT):
-            tool_name = f"tool T{i}" if i > 0 else "tool T0"
+            tool_name = f"tool T{i}"
             objects[tool_name] = ["gcode_x_offset", "gcode_y_offset", "gcode_z_offset"]
             objects[f"tool_probe T{i}"] = ["x_offset", "y_offset", "z_offset"]
         
@@ -209,7 +209,11 @@ def register_toolchanger_tools(mcp):
     async def stop_crash_detection() -> str:
         """
         Disable tool crash detection.
+        REQUIRES: System must be ARMED.
         """
+        if not config.ARMED:
+            return json.dumps({"error": "System not ARMED."})
+
         client = get_client()
         result = await client.run_gcode("STOP_TOOL_CRASH_DETECTION")
         
@@ -277,9 +281,11 @@ def register_toolchanger_tools(mcp):
         if target < 0 or target > 350:
             return json.dumps({"error": f"Invalid temperature {target}"})
         
-        heater = "extruder" if tool_number == 0 else f"extruder{tool_number}"
-        
         client = get_client()
+        # M104's T parameter targets an extruder index, which this toolchanger's
+        # config defines 1:1 with tool_number (tool 0 -> extruder, tool 1 ->
+        # extruder1, etc.), matching the extruder{N} naming used elsewhere
+        # (see tools/printer.py get_temperatures).
         result = await client.run_gcode(f"M104 T{tool_number} S{target}")
         
         if "error" in result:
