@@ -7,12 +7,100 @@ import os
 from typing import Optional
 import config
 from moonraker import get_client
+from tools.security import verify_pin
 
 
 def is_path_allowed(path: str) -> bool:
-    """Check if path is within allowed directories."""
+    """Check if a local filesystem path is within one of the allowed directories."""
     abs_path = os.path.abspath(path)
-    return any(abs_path.startswith(allowed) for allowed in config.ALLOWED_PATHS)
+    return any(abs_path.startswith(os.path.abspath(allowed)) for allowed in config.ALLOWED_PATHS)
+
+
+# Moonraker file-API roots this module understands. "backups" is intentionally
+# excluded here: it's a local-only directory (config.BACKUP_PATH) managed by
+# tools/backup.py, not something exposed via Moonraker's /server/files API.
+ROOT_ALIASES = {
+    "gcode": "gcodes",
+}
+KNOWN_ROOTS = {"config", "gcodes", "logs", "timelapse"}
+# Roots that have a corresponding local path (from config.ALLOWED_PATHS) we can
+# validate resolved paths against. Roots without a local counterpart (e.g.
+# "timelapse", which only exists on the Moonraker side) still get traversal
+# protection, just not a local-root containment check.
+ROOT_LOCAL_PATH = {
+    "config": config.CONFIG_PATH,
+    "gcodes": config.GCODES_PATH,
+    "logs": config.LOGS_PATH,
+}
+DEFAULT_ROOT = "config"
+
+
+def _infer_root_and_path(filepath: str, explicit_root: Optional[str] = None):
+    """
+    Split a caller-supplied path into a Moonraker root + path relative to that root.
+
+    Accepts either an explicit `root` argument, or a `root/relative/path`
+    convention baked into `filepath` itself (e.g. "gcodes/sub/file.gcode").
+    Falls back to DEFAULT_ROOT ("config") when neither indicates a known root,
+    preserving prior behavior for bare filenames like "printer.cfg" or
+    "macros/custom.cfg".
+    """
+    filepath = filepath.lstrip("/")
+
+    if explicit_root:
+        root = ROOT_ALIASES.get(explicit_root.lower(), explicit_root.lower())
+        return root, filepath
+
+    head, sep, rest = filepath.partition("/")
+    head_lower = head.lower()
+    if head_lower in KNOWN_ROOTS or head_lower in ROOT_ALIASES:
+        root = ROOT_ALIASES.get(head_lower, head_lower)
+        return root, rest
+
+    return DEFAULT_ROOT, filepath
+
+
+def _check_path_allowed(root: str, relative_path: str) -> Optional[str]:
+    """Return an error message if the resolved path escapes its allowed root, else None."""
+    normalized = os.path.normpath(relative_path) if relative_path else "."
+    if normalized in (".", "") or normalized.startswith("..") or os.path.isabs(normalized):
+        return f"Invalid or disallowed path: {relative_path!r}"
+
+    local_base = ROOT_LOCAL_PATH.get(root)
+    if local_base is not None:
+        candidate = os.path.join(local_base, normalized)
+        if not is_path_allowed(candidate):
+            return f"Path '{relative_path}' is outside the allowed '{root}' root"
+
+    return None
+
+
+async def upload_to_moonraker(client, root: str, relative_path: str, content) -> dict:
+    """
+    Upload file content to Moonraker via POST /server/files/upload, correctly
+    setting the multipart 'root' and 'path' fields so subdirectories and
+    non-config roots are honored instead of being flattened into the root
+    directory. `path` carries the subdirectory only; the filename comes from
+    the 'file' field's filename attribute.
+
+    Returns the parsed Moonraker response dict (contains "error" on failure,
+    per MoonrakerClient._request's status-code handling).
+    """
+    import aiohttp
+
+    dirname, basename = os.path.split(relative_path)
+    data = aiohttp.FormData()
+    data.add_field(
+        'file',
+        content.encode('utf-8') if isinstance(content, str) else content,
+        filename=basename,
+        content_type='text/plain'
+    )
+    data.add_field('root', root)
+    if dirname:
+        data.add_field('path', dirname)
+
+    return await client.post('/server/files/upload', data=data)
 
 
 def register_filesystem_tools(mcp):
@@ -30,17 +118,27 @@ def register_filesystem_tools(mcp):
         Returns list of files with names, sizes, and modification dates.
         """
         client = get_client()
-        
-        # Map common names to roots
+
+        # Map common names to roots (also accepts arbitrary Moonraker roots,
+        # or a "root/subdir" full path, passed straight through).
         root_map = {
             "gcodes": "gcodes",
             "gcode": "gcodes",
             "config": "config",
             "logs": "logs",
         }
-        
-        root = root_map.get(directory.lower(), directory)
-        
+
+        directory = directory.lstrip("/")
+        head, _, _ = directory.partition("/")
+        root = root_map.get(directory.lower(), root_map.get(head.lower(), directory))
+
+        # Validate against path traversal (and, for roots with a local
+        # counterpart, against config.ALLOWED_PATHS).
+        root_head, _, root_rest = root.partition("/")
+        disallow_reason = _check_path_allowed(root_head.lower(), root_rest) if root_rest else None
+        if disallow_reason:
+            return json.dumps({"error": disallow_reason})
+
         result = await client.get_directory(root)
         
         if "error" in result:
@@ -97,41 +195,40 @@ def register_filesystem_tools(mcp):
         return json.dumps({"gcode_files": gcode_files}, indent=2)
     
     @mcp.tool()
-    async def read_file(filepath: str, max_lines: int = 500) -> str:
+    async def read_file(filepath: str, max_lines: int = 500, root: Optional[str] = None) -> str:
         """
         Read contents of a file from the printer.
-        
+
         Args:
-            filepath: Path to file relative to printer_data (e.g., 'config/printer.cfg')
+            filepath: Path to the file. Either a 'root/relative/path' (e.g.
+                'gcodes/sub/file.gcode', 'config/printer.cfg', 'logs/klippy.log',
+                'timelapse/video.mp4'), or a path relative to `root` when that
+                argument is given. Bare filenames default to the 'config' root.
             max_lines: Maximum lines to return (default: 500, to avoid huge responses)
-        
+            root: Optional explicit Moonraker root ('config', 'gcodes', 'logs',
+                'timelapse'). Inferred from filepath's leading segment when omitted.
+
         For G-code files, use get_gcode_metadata instead for analysis.
         """
         client = get_client()
-        
-        # Determine root and path
-        if filepath.startswith("config/"):
-            root = "config"
-            filename = filepath[7:]  # Remove 'config/'
-        elif filepath.startswith("logs/"):
-            root = "logs"
-            filename = filepath[5:]
-        else:
-            # Assume config if not specified
-            root = "config"
-            filename = filepath
-        
+
+        resolved_root, relative_path = _infer_root_and_path(filepath, root)
+
+        disallow_reason = _check_path_allowed(resolved_root, relative_path)
+        if disallow_reason:
+            return json.dumps({"error": disallow_reason})
+
         # Use Moonraker's file download endpoint
         session = await client._get_session()
-        url = f"{client.base_url}/server/files/{root}/{filename}"
-        
+        url = f"{client.base_url}/server/files/{resolved_root}/{relative_path}"
+
         try:
             async with session.get(url) as response:
                 if response.status == 404:
-                    return json.dumps({"error": f"File not found: {filepath}"})
+                    return json.dumps({"error": f"File not found: {resolved_root}/{relative_path}"})
                 response.raise_for_status()
                 content = await response.text()
-                
+
                 # Limit lines
                 lines = content.split('\n')
                 if len(lines) > max_lines:
@@ -139,9 +236,9 @@ def register_filesystem_tools(mcp):
                     truncated = True
                 else:
                     truncated = False
-                
+
                 return json.dumps({
-                    "filepath": filepath,
+                    "filepath": f"{resolved_root}/{relative_path}",
                     "content": content,
                     "lines": min(len(lines), max_lines),
                     "truncated": truncated,
@@ -151,77 +248,77 @@ def register_filesystem_tools(mcp):
             return json.dumps({"error": str(e)})
     
     @mcp.tool()
-    async def write_file(filepath: str, content: str, pin: str) -> str:
+    async def write_file(filepath: str, content: str, pin: str, root: Optional[str] = None) -> str:
         """
         Write content to a file on the printer.
         REQUIRES: Admin PIN for safety.
-        
+
         Args:
-            filepath: Path relative to config directory (e.g., 'macros/custom.cfg')
+            filepath: Path, either relative to `root` (e.g. 'macros/custom.cfg' under
+                the default 'config' root) or using a 'root/relative/path' convention
+                (e.g. 'gcodes/sub/file.gcode').
             content: File content to write
             pin: Admin PIN to authorize write operation
-        
+            root: Optional explicit Moonraker root ('config', 'gcodes', 'logs',
+                'timelapse'). Defaults to 'config' when not inferable from filepath.
+
         WARNING: Be careful writing to printer.cfg - invalid config can prevent Klipper from starting.
         """
-        if pin != config.ADMIN_PIN:
+        if not verify_pin(pin, config.ADMIN_PIN):
             return json.dumps({"error": "Invalid PIN. Write operation not authorized."})
-        
+
+        resolved_root, relative_path = _infer_root_and_path(filepath, root)
+
+        disallow_reason = _check_path_allowed(resolved_root, relative_path)
+        if disallow_reason:
+            return json.dumps({"error": disallow_reason})
+
         client = get_client()
-        session = await client._get_session()
-        
-        # Determine root
-        if filepath.startswith("config/"):
-            root = "config"
-            filename = filepath[7:]
-        else:
-            root = "config"
-            filename = filepath
-        
-        url = f"{client.base_url}/server/files/upload"
-        
+
         try:
-            # Create multipart form data
-            import aiohttp
-            data = aiohttp.FormData()
-            data.add_field('file',
-                          content.encode('utf-8'),
-                          filename=filename,
-                          content_type='text/plain')
-            data.add_field('root', root)
-            
-            async with session.post(url, data=data) as response:
-                response.raise_for_status()
-                result = await response.json()
-                
-                return json.dumps({
-                    "success": True,
-                    "filepath": f"{root}/{filename}",
-                    "message": "File written successfully"
-                })
+            result = await upload_to_moonraker(client, resolved_root, relative_path, content)
         except Exception as e:
             return json.dumps({"error": str(e)})
+
+        if "error" in result:
+            return json.dumps({"error": result["error"]})
+
+        return json.dumps({
+            "success": True,
+            "filepath": f"{resolved_root}/{relative_path}",
+            "moonraker_result": result.get("result"),
+            "message": "File written successfully"
+        })
     
     @mcp.tool()
-    async def delete_file(filepath: str, pin: str) -> str:
+    async def delete_file(filepath: str, pin: str, root: Optional[str] = None) -> str:
         """
         Delete a file from the printer.
         REQUIRES: Admin PIN for safety.
-        
+
         Args:
             filepath: Path to file (e.g., 'gcodes/old_print.gcode')
             pin: Admin PIN to authorize deletion
+            root: Optional explicit Moonraker root ('config', 'gcodes', 'logs',
+                'timelapse'). Inferred from filepath's leading segment when omitted.
         """
-        if pin != config.ADMIN_PIN:
+        if not verify_pin(pin, config.ADMIN_PIN):
             return json.dumps({"error": "Invalid PIN. Delete operation not authorized."})
-        
+
+        resolved_root, relative_path = _infer_root_and_path(filepath, root)
+
+        disallow_reason = _check_path_allowed(resolved_root, relative_path)
+        if disallow_reason:
+            return json.dumps({"error": disallow_reason})
+
         client = get_client()
-        
-        result = await client.delete_file(filepath)
-        
+
+        result = await client.delete_file(f"{resolved_root}/{relative_path}")
+
         if "error" in result:
             return json.dumps({"error": result["error"]})
-        
-        return json.dumps({"success": True, "deleted": filepath})
+
+        return json.dumps({"success": True, "deleted": f"{resolved_root}/{relative_path}"})
     
     @mcp.tool()
     async def get_gcode_metadata(filename: str) -> str:
@@ -231,6 +328,10 @@ def register_filesystem_tools(mcp):
         Args:
             filename: G-code filename
         """
+        disallow_reason = _check_path_allowed("gcodes", filename)
+        if disallow_reason:
+            return json.dumps({"error": disallow_reason})
+
         client = get_client()
         result = await client.get_file_metadata(filename)
         
@@ -285,49 +386,48 @@ def register_filesystem_tools(mcp):
         return json.dumps({"config_files": config_files}, indent=2)
     
     @mcp.tool()
-    async def search_in_file(filepath: str, search_term: str) -> str:
+    async def search_in_file(filepath: str, search_term: str, root: Optional[str] = None) -> str:
         """
         Search for a term in a file and return matching lines.
-        
+
         Args:
-            filepath: Path to file (e.g., 'config/printer.cfg')
+            filepath: Path to file, either 'root/relative/path' (e.g. 'config/printer.cfg',
+                'gcodes/sub/file.gcode', 'logs/klippy.log') or relative to `root` when given.
             search_term: Text to search for (case-insensitive)
+            root: Optional explicit Moonraker root ('config', 'gcodes', 'logs', 'timelapse').
+                Inferred from filepath's leading segment when omitted.
         """
         # First read the file
         client = get_client()
-        
-        if filepath.startswith("config/"):
-            root = "config"
-            filename = filepath[7:]
-        elif filepath.startswith("logs/"):
-            root = "logs"
-            filename = filepath[5:]
-        else:
-            root = "config"
-            filename = filepath
-        
+
+        resolved_root, relative_path = _infer_root_and_path(filepath, root)
+
+        disallow_reason = _check_path_allowed(resolved_root, relative_path)
+        if disallow_reason:
+            return json.dumps({"error": disallow_reason})
+
         session = await client._get_session()
-        url = f"{client.base_url}/server/files/{root}/{filename}"
-        
+        url = f"{client.base_url}/server/files/{resolved_root}/{relative_path}"
+
         try:
             async with session.get(url) as response:
                 if response.status == 404:
-                    return json.dumps({"error": f"File not found: {filepath}"})
+                    return json.dumps({"error": f"File not found: {resolved_root}/{relative_path}"})
                 response.raise_for_status()
                 content = await response.text()
-                
+
                 matches = []
                 search_lower = search_term.lower()
-                
+
                 for i, line in enumerate(content.split('\n'), 1):
                     if search_lower in line.lower():
                         matches.append({
                             "line_number": i,
                             "content": line.strip()
                         })
-                
+
                 return json.dumps({
-                    "filepath": filepath,
+                    "filepath": f"{resolved_root}/{relative_path}",
                     "search_term": search_term,
                     "matches": matches,
                     "match_count": len(matches)
