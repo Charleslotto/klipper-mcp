@@ -74,17 +74,16 @@ ExecStart=$VENV_DIR/bin/python server.py
 Restart=always
 RestartSec=10
 
-# Logging
-StandardOutput=append:/var/log/klipper-mcp.log
-StandardError=append:/var/log/klipper-mcp.log
-
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
+# Register with Moonraker so it can manage/restart the service after updates
+grep -qxF 'klipper-mcp' ~/printer_data/moonraker.asvc 2>/dev/null || echo 'klipper-mcp' >> ~/printer_data/moonraker.asvc
+
 # Install systemd service
 echo "Installing systemd service..."
-sudo cp "$INSTALL_DIR/klipper-mcp.service" /etc/systemd/system/
+sudo cp "$INSTALL_DIR/klipper-mcp.service" /etc/systemd/system/klipper-mcp.service
 sudo systemctl daemon-reload
 sudo systemctl enable "$SERVICE_NAME"
 

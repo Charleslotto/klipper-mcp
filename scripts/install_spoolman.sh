@@ -3,7 +3,7 @@
 
 set -e
 
-SPOOLMAN_DIR="/home/biqu/spoolman"
+SPOOLMAN_DIR="${SPOOLMAN_INSTALL_DIR:-$HOME/spoolman}"
 SPOOLMAN_VERSION="0.19.3"
 
 echo "=== Installing Spoolman v${SPOOLMAN_VERSION} ==="
@@ -50,7 +50,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=biqu
+User=$USER
 WorkingDirectory=${SPOOLMAN_DIR}
 ExecStart=${SPOOLMAN_DIR}/.venv/bin/uvicorn spoolman.main:app --host 0.0.0.0 --port 7912
 Restart=always

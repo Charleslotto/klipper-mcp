@@ -49,9 +49,10 @@ ADMIN_PIN = os.getenv("ADMIN_PIN", "123456")
 
 # =============================================================================
 # FILE PATHS
-# Derived from $HOME by default; override with env vars for custom setups
+# Derived from $HOME by default; override with PRINTER_DATA_PATH or
+# KLIPPER_DATA_DIR env vars for custom setups.
 # =============================================================================
-PRINTER_DATA_PATH = os.getenv("PRINTER_DATA_PATH", os.path.join(_HOME, "printer_data"))
+PRINTER_DATA_PATH = os.getenv("PRINTER_DATA_PATH", os.getenv("KLIPPER_DATA_DIR", os.path.join(_HOME, "printer_data")))
 CONFIG_PATH = f"{PRINTER_DATA_PATH}/config"
 GCODES_PATH = f"{PRINTER_DATA_PATH}/gcodes"
 LOGS_PATH = f"{PRINTER_DATA_PATH}/logs"

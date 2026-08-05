@@ -15,9 +15,5 @@ ExecStart=%h/klipper-mcp/venv/bin/python server.py
 Restart=always
 RestartSec=10
 
-# Logging
-StandardOutput=append:/var/log/klipper-mcp.log
-StandardError=append:/var/log/klipper-mcp.log
-
 [Install]
 WantedBy=multi-user.target

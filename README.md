@@ -186,7 +186,7 @@ This server exposes **100+ tools** for complete printer management, from basic o
 
 ```bash
 # 1. SSH into your printer
-ssh biqu@192.168.x.x  # or pi@192.168.x.x for Raspberry Pi
+ssh <user>@192.168.x.x  # e.g. biqu@ for BTT CB1, pi@ for Raspberry Pi
 
 # 2. Clone the repository
 cd ~

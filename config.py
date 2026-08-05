@@ -34,8 +34,10 @@ ADMIN_PIN = os.getenv("ADMIN_PIN", "123456")
 
 # =============================================================================
 # FILE PATHS
+# Override the base with PRINTER_DATA_PATH or KLIPPER_DATA_DIR for custom setups.
+# Default: ~/printer_data (works for standard Klipper on any user account)
 # =============================================================================
-PRINTER_DATA_PATH = os.getenv("PRINTER_DATA_PATH", os.path.join(_HOME, "printer_data"))
+PRINTER_DATA_PATH = os.getenv("PRINTER_DATA_PATH", os.getenv("KLIPPER_DATA_DIR", os.path.join(_HOME, "printer_data")))
 CONFIG_PATH = f"{PRINTER_DATA_PATH}/config"
 GCODES_PATH = f"{PRINTER_DATA_PATH}/gcodes"
 LOGS_PATH = f"{PRINTER_DATA_PATH}/logs"
