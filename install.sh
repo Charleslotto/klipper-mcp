@@ -14,14 +14,13 @@ PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.v
 echo "Python version: $PYTHON_VERSION"
 
 # Configuration
-INSTALL_DIR="/home/biqu/klipper-mcp"
+INSTALL_DIR="${KLIPPER_MCP_DIR:-$HOME/klipper-mcp}"
 VENV_DIR="$INSTALL_DIR/venv"
 SERVICE_NAME="klipper-mcp"
+CURRENT_USER="$(whoami)"
 
-# Check if running as biqu user
-if [ "$USER" != "biqu" ]; then
-    echo "Warning: Running as $USER, not biqu"
-fi
+echo "Installing as user: $CURRENT_USER"
+echo "Install directory: $INSTALL_DIR"
 
 # Create installation directory
 echo "Creating installation directory..."
@@ -54,18 +53,34 @@ pip install -r "$INSTALL_DIR/requirements.txt"
 if [ ! -f "$INSTALL_DIR/config.py" ]; then
     echo "Creating default config.py..."
     # The config.py should already be copied, but create if missing
-    cat > "$INSTALL_DIR/config.py" << 'EOF'
-# Edit this file with your printer's settings
-MOONRAKER_URL = "http://localhost:7125"
-PRINTER_NAME = "Voron"
-MCP_HOST = "0.0.0.0"
-MCP_PORT = 8000
-MCP_TRANSPORT = "http"
-API_KEY = "your-secret-key-here"
-ARMED = False
-ADMIN_PIN = "0000"
-EOF
+    cp "$INSTALL_DIR/config.example.py" "$INSTALL_DIR/config.py"
 fi
+
+# Generate systemd service file for current user/paths
+echo "Generating systemd service file..."
+cat > "$INSTALL_DIR/klipper-mcp.service" << SVCEOF
+[Unit]
+Description=Klipper MCP Server
+After=network.target moonraker.service
+Wants=moonraker.service
+
+[Service]
+Type=simple
+User=$CURRENT_USER
+Group=$CURRENT_USER
+WorkingDirectory=$INSTALL_DIR
+Environment="PATH=$VENV_DIR/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=$VENV_DIR/bin/python server.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/var/log/klipper-mcp.log
+StandardError=append:/var/log/klipper-mcp.log
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
 
 # Install systemd service
 echo "Installing systemd service..."
@@ -75,7 +90,7 @@ sudo systemctl enable "$SERVICE_NAME"
 
 # Create log file
 sudo touch /var/log/klipper-mcp.log
-sudo chown biqu:biqu /var/log/klipper-mcp.log
+sudo chown "$CURRENT_USER:$CURRENT_USER" /var/log/klipper-mcp.log
 
 echo ""
 echo "=========================================="
@@ -98,5 +113,5 @@ echo "5. View logs:"
 echo "   tail -f /var/log/klipper-mcp.log"
 echo ""
 echo "MCP server will be available at:"
-echo "   http://$(hostname -I | awk '{print $1}'):8000/mcp"
+echo "   http://$(hostname -I | awk '{print $1}'):${MCP_PORT:-8000}/mcp"
 echo ""

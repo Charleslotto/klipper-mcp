@@ -1,3 +1,5 @@
+# This is a template. install.sh generates the actual service file
+# with correct user and paths for your system.
 [Unit]
 Description=Klipper MCP Server
 After=network.target moonraker.service
@@ -5,11 +7,11 @@ Wants=moonraker.service
 
 [Service]
 Type=simple
-User=biqu
-Group=biqu
-WorkingDirectory=/home/biqu/klipper-mcp
-Environment="PATH=/home/biqu/klipper-mcp/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/home/biqu/klipper-mcp/venv/bin/python server.py
+User=%u
+Group=%u
+WorkingDirectory=%h/klipper-mcp
+Environment="PATH=%h/klipper-mcp/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=%h/klipper-mcp/venv/bin/python server.py
 Restart=always
 RestartSec=10
 

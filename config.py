@@ -4,6 +4,10 @@ Configure your Voron printer settings here.
 """
 import os
 
+# Base directories (derived from environment, never hardcoded)
+_HOME = os.path.expanduser("~")
+_MCP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # =============================================================================
 # MOONRAKER CONNECTION
 # =============================================================================
@@ -29,9 +33,9 @@ ARMED = os.getenv("ARMED", "true").lower() == "true"
 ADMIN_PIN = os.getenv("ADMIN_PIN", "123456")
 
 # =============================================================================
-# FILE PATHS (CB1/Raspberry Pi paths)
+# FILE PATHS
 # =============================================================================
-PRINTER_DATA_PATH = os.getenv("PRINTER_DATA_PATH", "/home/biqu/printer_data")
+PRINTER_DATA_PATH = os.getenv("PRINTER_DATA_PATH", os.path.join(_HOME, "printer_data"))
 CONFIG_PATH = f"{PRINTER_DATA_PATH}/config"
 GCODES_PATH = f"{PRINTER_DATA_PATH}/gcodes"
 LOGS_PATH = f"{PRINTER_DATA_PATH}/logs"
@@ -98,8 +102,8 @@ TOOL_NAMES = {
 # =============================================================================
 # MAINTENANCE TRACKING
 # =============================================================================
-MAINTENANCE_DATA_FILE = os.getenv("MAINTENANCE_DATA_FILE", "/home/biqu/klipper-mcp/data/maintenance.json")
-AUDIT_LOG_FILE = os.getenv("AUDIT_LOG_FILE", "/home/biqu/klipper-mcp/data/audit.log")
+MAINTENANCE_DATA_FILE = os.getenv("MAINTENANCE_DATA_FILE", os.path.join(_MCP_DIR, "data", "maintenance.json"))
+AUDIT_LOG_FILE = os.getenv("AUDIT_LOG_FILE", os.path.join(_MCP_DIR, "data", "audit.log"))
 
 # Maintenance intervals (in hours)
 MAINTENANCE_INTERVALS = {
@@ -114,7 +118,7 @@ MAINTENANCE_INTERVALS = {
 # =============================================================================
 # LED SCENES
 # =============================================================================
-LED_SCENES_FILE = os.getenv("LED_SCENES_FILE", "/home/biqu/klipper-mcp/scenes/led_scenes.json")
+LED_SCENES_FILE = os.getenv("LED_SCENES_FILE", os.path.join(_MCP_DIR, "scenes", "led_scenes.json"))
 
 # Aliases for backward compatibility
 MAINTENANCE_LOG_PATH = MAINTENANCE_DATA_FILE
