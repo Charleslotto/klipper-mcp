@@ -4,33 +4,37 @@ Handles all communication with Moonraker's HTTP API.
 """
 import aiohttp
 import asyncio
+import re
 from typing import Any, Optional, Dict, List
 import config
 
 
 class MoonrakerClient:
     """Async client for Moonraker HTTP API."""
-    
+
     def __init__(self, base_url: str = None):
         self.base_url = (base_url or config.MOONRAKER_URL).rstrip("/")
         self._session: Optional[aiohttp.ClientSession] = None
-    
+        self._session_lock = asyncio.Lock()
+        self._timeout_seconds = getattr(config, "MOONRAKER_TIMEOUT_SECONDS", 120)
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
-        if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=30)
-            self._session = aiohttp.ClientSession(timeout=timeout)
-        return self._session
-    
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
+                self._session = aiohttp.ClientSession(timeout=timeout)
+            return self._session
+
     async def close(self):
         """Close the session."""
         if self._session and not self._session.closed:
             await self._session.close()
-    
+
     async def _request(
-        self, 
-        method: str, 
-        endpoint: str, 
+        self,
+        method: str,
+        endpoint: str,
         params: Dict = None,
         json_data: Dict = None,
         data: Any = None
@@ -38,17 +42,38 @@ class MoonrakerClient:
         """Make HTTP request to Moonraker."""
         session = await self._get_session()
         url = f"{self.base_url}{endpoint}"
-        
+
         try:
             async with session.request(
-                method, 
-                url, 
-                params=params, 
+                method,
+                url,
+                params=params,
                 json=json_data,
                 data=data
             ) as response:
-                response.raise_for_status()
+                if response.status >= 400:
+                    message = None
+                    try:
+                        body = await response.json()
+                        err = body.get("error") if isinstance(body, dict) else None
+                        if isinstance(err, dict):
+                            message = err.get("message")
+                        elif isinstance(err, str):
+                            message = err
+                    except Exception:
+                        pass
+                    if not message:
+                        try:
+                            message = await response.text()
+                        except Exception:
+                            message = f"HTTP {response.status} error"
+                    return {"error": message, "status": response.status}
                 return await response.json()
+        except asyncio.TimeoutError:
+            return {
+                "error": f"Request to {endpoint} timed out after {self._timeout_seconds}s",
+                "status": "timeout"
+            }
         except aiohttp.ClientError as e:
             return {"error": str(e)}
     
@@ -85,7 +110,9 @@ class MoonrakerClient:
         objects = {
             "heater_bed": ["temperature", "target", "power"],
             "extruder": ["temperature", "target", "power", "pressure_advance"],
-            "toolhead": ["position", "homed_axes", "print_time", "estimated_print_time"],
+            "extruder1": ["temperature", "target", "power", "pressure_advance"],
+            "extruder2": ["temperature", "target", "power", "pressure_advance"],
+            "toolhead": ["position", "homed_axes", "print_time", "estimated_print_time", "max_velocity", "max_accel"],
             "print_stats": ["state", "filename", "total_duration", "print_duration", "filament_used", "message"],
             "virtual_sdcard": ["file_position", "progress", "is_active"],
             "gcode_move": ["speed", "speed_factor", "extrude_factor"],
@@ -124,11 +151,15 @@ class MoonrakerClient:
     
     async def set_heater_temperature(self, heater: str, target: float) -> Dict:
         """Set heater target temperature."""
+        if not isinstance(target, (int, float)):
+            return {"error": f"Invalid target temperature: {target!r}"}
         if heater == "extruder":
             gcode = f"M104 S{target}"
         elif heater == "heater_bed":
             gcode = f"M140 S{target}"
         else:
+            if not re.match(r'^[A-Za-z0-9_]+$', heater):
+                return {"error": f"Invalid heater name: {heater}"}
             gcode = f"SET_HEATER_TEMPERATURE HEATER={heater} TARGET={target}"
         return await self.run_gcode(gcode)
     
@@ -151,7 +182,22 @@ class MoonrakerClient:
     async def get_directory(self, path: str = "gcodes") -> Dict:
         """Get directory listing with details."""
         return await self.get("/server/files/directory", params={"path": path})
-    
+
+    async def get_file_content_range(self, root: str, path: str, start: int = None, end: int = None) -> str:
+        """
+        Fetch file content, optionally as a byte range, to avoid pulling huge files
+        (large G-code, klippy.log) fully into memory just to grep a few lines.
+        Falls back to a full download if the server ignores the Range header.
+        """
+        session = await self._get_session()
+        url = f"{self.base_url}/server/files/{root}/{path}"
+        headers = {}
+        if start is not None:
+            headers["Range"] = f"bytes={start}-{end}" if end is not None else f"bytes={start}-"
+        async with session.get(url, headers=headers) as response:
+            response.raise_for_status()
+            return await response.text()
+
     # =========================================================================
     # PRINT CONTROL
     # =========================================================================
@@ -248,18 +294,57 @@ class MoonrakerClient:
     async def get_gcode_store(self, count: int = 100) -> Dict:
         """Get recent G-code responses."""
         return await self.get("/server/gcode_store", params={"count": count})
-    
+
+    async def rollover_logs(self, application: str) -> Dict:
+        """Rotate a log file instead of destructively truncating it in place."""
+        return await self.post("/server/logs/rollover", json_data={"application": application})
+
+    # =========================================================================
+    # SPOOLMAN
+    # =========================================================================
+
+    async def get_spool_id(self) -> Dict:
+        """Get the currently active Spoolman spool ID via Moonraker's proxy."""
+        return await self.get("/server/spoolman/spool_id")
+
     # =========================================================================
     # MACHINE CONTROL
     # =========================================================================
-    
+
     async def reboot_system(self) -> Dict:
         """Reboot the host system."""
         return await self.post("/machine/reboot")
-    
+
     async def shutdown_system(self) -> Dict:
         """Shutdown the host system."""
         return await self.post("/machine/shutdown")
+
+    async def get_machine_system_info(self) -> Dict:
+        """Get info about the host machine Moonraker itself runs on."""
+        return await self.get("/machine/system_info")
+
+    async def get_machine_proc_stats(self) -> Dict:
+        """Get CPU/memory/network stats for the host machine Moonraker runs on."""
+        return await self.get("/machine/proc_stats")
+
+    async def machine_service_action(self, service: str, action: str) -> Dict:
+        """Start/stop/restart a systemd service on the machine Moonraker runs on, via Moonraker (not local sudo)."""
+        if action not in ("start", "stop", "restart"):
+            return {"error": f"Invalid service action: {action}"}
+        return await self.post(f"/machine/services/{action}", json_data={"service": service})
+
+    # =========================================================================
+    # UPDATE MANAGER
+    # =========================================================================
+
+    async def update_refresh(self, name: str = None) -> Dict:
+        """Refresh update status for one component (or all if name is None)."""
+        json_data = {"name": name} if name else None
+        return await self.post("/machine/update/refresh", json_data=json_data)
+
+    async def update_upgrade(self, name: str) -> Dict:
+        """Upgrade a single named component (client/system/klipper/moonraker/etc)."""
+        return await self.post("/machine/update/upgrade", json_data={"name": name})
 
 
 # Singleton instance

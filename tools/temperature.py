@@ -6,6 +6,7 @@ import json
 from typing import Optional, List
 import config
 from moonraker import get_client
+from tools.security import sanitize_gcode_param
 
 
 def register_temperature_tools(mcp):
@@ -208,10 +209,19 @@ def register_temperature_tools(mcp):
     async def load_bed_mesh_profile(profile_name: str) -> str:
         """
         Load a saved bed mesh profile.
-        
+        REQUIRES: System must be ARMED.
+
         Args:
             profile_name: Name of the profile to load
         """
+        if not config.ARMED:
+            return json.dumps({"error": "System not ARMED."})
+
+        try:
+            profile_name = sanitize_gcode_param(profile_name, "profile_name")
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
         client = get_client()
         result = await client.load_bed_mesh(profile_name)
         
@@ -247,28 +257,70 @@ def register_temperature_tools(mcp):
     async def save_bed_mesh_profile(profile_name: str) -> str:
         """
         Save current bed mesh to a named profile.
-        
+        REQUIRES: System must be ARMED. Refuses to run SAVE_CONFIG while a
+        print is active or paused, since SAVE_CONFIG rewrites printer.cfg and
+        triggers a full Klipper restart (which would abort the print and
+        commit any other pending config changes with no way to undo).
+
         Args:
             profile_name: Name for the saved profile
         """
+        if not config.ARMED:
+            return json.dumps({"error": "System not ARMED."})
+
+        try:
+            profile_name = sanitize_gcode_param(profile_name, "profile_name")
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
         client = get_client()
         result = await client.run_gcode(f"BED_MESH_PROFILE SAVE={profile_name}")
-        
+
         if "error" in result:
             return json.dumps({"error": result["error"]})
-        
-        # Also save config
-        await client.run_gcode("SAVE_CONFIG")
-        
+
+        # SAVE_CONFIG restarts Klipper, which would abort an in-progress print.
+        # Refuse to run it if a print is currently printing or paused.
+        status_result = await client.query_printer_objects({"print_stats": ["state"]})
+        if "error" in status_result:
+            return json.dumps({
+                "error": f"Bed mesh profile saved, but could not verify print state before "
+                         f"SAVE_CONFIG: {status_result['error']}. Config was NOT saved.",
+                "saved_profile": profile_name,
+                "config_saved": False,
+            })
+
+        print_state = status_result.get("result", {}).get("status", {}).get("print_stats", {}).get("state")
+        if print_state in ("printing", "paused"):
+            return json.dumps({
+                "error": f"Refusing to run SAVE_CONFIG while a print is {print_state}. "
+                         "SAVE_CONFIG triggers a full Klipper restart and would abort the print. "
+                         "Wait until the print finishes, then save the config separately.",
+                "saved_profile": profile_name,
+                "config_saved": False,
+            })
+
+        save_config_result = await client.run_gcode("SAVE_CONFIG")
+        if "error" in save_config_result:
+            return json.dumps({
+                "error": f"Bed mesh profile saved, but SAVE_CONFIG failed: {save_config_result['error']}",
+                "saved_profile": profile_name,
+                "config_saved": False,
+            })
+
         return json.dumps({
             "success": True,
             "saved_profile": profile_name,
+            "config_saved": True,
             "message": "Profile saved and config updated"
         })
     
     @mcp.tool()
     async def clear_bed_mesh() -> str:
-        """Clear the currently loaded bed mesh."""
+        """Clear the currently loaded bed mesh. REQUIRES: System must be ARMED."""
+        if not config.ARMED:
+            return json.dumps({"error": "System not ARMED."})
+
         client = get_client()
         result = await client.run_gcode("BED_MESH_CLEAR")
         
@@ -289,14 +341,26 @@ def register_temperature_tools(mcp):
             heater: Heater name - 'extruder' or 'heater_bed'
         """
         client = get_client()
-        
+
+        # Confirm the heater actually exists before trusting all-null fields as
+        # "PID params really are zero" vs. "heater not found / no PID data".
+        objects_result = await client.get('/printer/objects/list')
+        if "error" in objects_result:
+            return json.dumps({"error": objects_result["error"]})
+        all_objects = objects_result.get('result', {}).get('objects', [])
+        if heater not in all_objects:
+            return json.dumps({
+                "error": f"Heater '{heater}' not found on printer.",
+                "available_heaters": [o for o in all_objects if o.startswith("extruder") or o.startswith("heater_")],
+            })
+
         result = await client.query_printer_objects({
             heater: ["control", "pid_kp", "pid_ki", "pid_kd"]
         })
-        
+
         if "error" in result:
             return json.dumps({"error": result["error"]})
-        
+
         status = result.get("result", {}).get("status", {})
         heater_data = status.get(heater, {})
         

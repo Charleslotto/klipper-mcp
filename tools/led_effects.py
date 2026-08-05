@@ -7,6 +7,7 @@ import os
 from typing import Optional
 import config
 from moonraker import get_client
+from tools.security import sanitize_gcode_param
 
 
 # Pre-defined LED scenes for common printer states
@@ -88,8 +89,19 @@ def register_led_tools(mcp):
             - set_led_effect("panel_idle")
             - set_led_effect("heating", fadetime=1.0, replace=True)
         """
+        if not config.ARMED:
+            return json.dumps({
+                "error": "System not ARMED. Set ARMED=true environment variable to enable G-code execution.",
+                "hint": "This is a safety feature to prevent accidental commands."
+            })
+
+        try:
+            effect = sanitize_gcode_param(effect, "effect")
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
         client = get_client()
-        
+
         cmd = f"SET_LED_EFFECT EFFECT={effect}"
         if fadetime > 0:
             cmd += f" FADETIME={fadetime}"
@@ -120,8 +132,19 @@ def register_led_tools(mcp):
             effect: Name of the LED effect to stop
             fadetime: Time in seconds to fade out (default: 0)
         """
+        if not config.ARMED:
+            return json.dumps({
+                "error": "System not ARMED. Set ARMED=true environment variable to enable G-code execution.",
+                "hint": "This is a safety feature to prevent accidental commands."
+            })
+
+        try:
+            effect = sanitize_gcode_param(effect, "effect")
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
         client = get_client()
-        
+
         cmd = f"SET_LED_EFFECT EFFECT={effect} STOP=1"
         if fadetime > 0:
             cmd += f" FADETIME={fadetime}"
@@ -145,8 +168,19 @@ def register_led_tools(mcp):
             leds: Optional LED chain to stop (e.g., "neopixel:panel_ring"). If None, stops all.
             fadetime: Time in seconds to fade out (default: 0)
         """
+        if not config.ARMED:
+            return json.dumps({
+                "error": "System not ARMED. Set ARMED=true environment variable to enable G-code execution.",
+                "hint": "This is a safety feature to prevent accidental commands."
+            })
+
+        try:
+            leds = sanitize_gcode_param(leds, "leds")
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
         client = get_client()
-        
+
         cmd = "STOP_LED_EFFECTS"
         if leds:
             cmd += f' LEDS="{leds}"'
@@ -267,13 +301,24 @@ def register_led_tools(mcp):
             white: White value 0.0-1.0 (for RGBW LEDs)
             index: Optional specific LED index to set
         """
+        if not config.ARMED:
+            return json.dumps({
+                "error": "System not ARMED. Set ARMED=true environment variable to enable G-code execution.",
+                "hint": "This is a safety feature to prevent accidental commands."
+            })
+
+        try:
+            led_chain = sanitize_gcode_param(led_chain, "led_chain")
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
         client = get_client()
-        
+
         # Validate color values
         for color, name in [(red, "red"), (green, "green"), (blue, "blue"), (white, "white")]:
             if not 0.0 <= color <= 1.0:
                 return json.dumps({"error": f"{name} must be between 0.0 and 1.0"})
-        
+
         # Parse chain name
         parts = led_chain.split(":")
         if len(parts) != 2:

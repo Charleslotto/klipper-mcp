@@ -6,6 +6,7 @@ import json
 from typing import Optional
 import aiohttp
 import config
+from tools.security import sanitize_gcode_param
 
 
 def register_notification_tools(mcp):
@@ -34,8 +35,14 @@ def register_notification_tools(mcp):
             message: Notification message body
             level: Severity level - 'info', 'warning', 'error', 'success'
         """
+        try:
+            safe_title = sanitize_gcode_param(title, "title")
+            safe_message = sanitize_gcode_param(message, "message")
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
         results = {}
-        
+
         payload = {
             "title": title,
             "message": message,
@@ -77,10 +84,20 @@ def register_notification_tools(mcp):
             results["pushover"] = await send_webhook("https://api.pushover.net/1/messages.json", pushover_payload)
         
         # Moonraker notification (shows in UI)
-        from moonraker import get_client
-        client = get_client()
-        await client.run_gcode(f'RESPOND PREFIX="{level.upper()}" MSG="{title}: {message}"')
-        results["moonraker"] = {"success": True}
+        if not config.ARMED:
+            results["moonraker"] = {
+                "error": "System not ARMED. Set ARMED=true environment variable to enable G-code execution."
+            }
+        else:
+            from moonraker import get_client
+            client = get_client()
+            moonraker_result = await client.run_gcode(
+                f'RESPOND PREFIX="{level.upper()}" MSG="{safe_title}: {safe_message}"'
+            )
+            if "error" in moonraker_result:
+                results["moonraker"] = {"error": moonraker_result["error"]}
+            else:
+                results["moonraker"] = {"success": True}
         
         return json.dumps({
             "notification_sent": True,
@@ -239,11 +256,23 @@ def register_notification_tools(mcp):
             message: The message to display
             prefix: Prefix type - 'info', 'warning', 'error', or custom
         """
+        if not config.ARMED:
+            return json.dumps({
+                "error": "System not ARMED. Set ARMED=true environment variable to enable G-code execution.",
+                "hint": "This is a safety feature to prevent accidental commands."
+            })
+
+        try:
+            safe_message = sanitize_gcode_param(message, "message")
+            safe_prefix = sanitize_gcode_param(prefix, "prefix")
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
         from moonraker import get_client
         client = get_client()
-        
+
         # RESPOND with prefix shows in console
-        gcode = f'RESPOND PREFIX="{prefix.upper()}" MSG="{message}"'
+        gcode = f'RESPOND PREFIX="{safe_prefix.upper()}" MSG="{safe_message}"'
         result = await client.run_gcode(gcode)
         
         if "error" in result:
@@ -251,5 +280,5 @@ def register_notification_tools(mcp):
         
         return json.dumps({
             "success": True,
-            "console_message": f"[{prefix.upper()}] {message}"
+            "console_message": f"[{safe_prefix.upper()}] {safe_message}"
         })

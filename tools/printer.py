@@ -6,6 +6,7 @@ import json
 from typing import Optional
 import config
 from moonraker import get_client
+from tools.security import verify_pin
 
 
 def register_printer_tools(mcp):
@@ -58,7 +59,7 @@ def register_printer_tools(mcp):
     
     @mcp.tool()
     async def get_temperatures() -> str:
-        """Get current temperatures for all heaters (bed, extruder, chamber if configured)."""
+        """Get current temperatures for all heaters (bed, extruder(s)). Does not query chamber sensors."""
         client = get_client()
         
         objects = {
@@ -102,11 +103,34 @@ def register_printer_tools(mcp):
         """
         if not config.ARMED:
             return json.dumps({"error": "System not ARMED. Set ARMED=true to enable temperature control."})
-        
-        if target < 0 or target > 350:
-            return json.dumps({"error": f"Invalid temperature {target}. Must be 0-350°C"})
-        
+
+        if target < 0:
+            return json.dumps({"error": f"Invalid temperature {target}. Must be >= 0°C"})
+
         client = get_client()
+
+        # Prefer the heater's real configured max_temp (from Klipper's
+        # configfile.settings) over a hardcoded ceiling that's really tuned
+        # for hotends. A bed's real max_temp is usually far lower
+        # (~120-130°C), and letting a bed target through a hotend-sized
+        # ceiling only lets it fail later as a hard Klipper max_temp shutdown.
+        max_temp = 350  # fallback ceiling, used if lookup fails or heater isn't found
+        settings_result = await client.query_printer_objects({"configfile": ["settings"]})
+        if "error" not in settings_result:
+            heater_settings = (
+                settings_result.get("result", {})
+                .get("status", {})
+                .get("configfile", {})
+                .get("settings", {})
+                .get(heater.lower(), {})
+            )
+            configured_max = heater_settings.get("max_temp")
+            if isinstance(configured_max, (int, float)):
+                max_temp = configured_max
+
+        if target > max_temp:
+            return json.dumps({"error": f"Invalid temperature {target}. Must be 0-{max_temp}°C for '{heater}'"})
+
         result = await client.set_heater_temperature(heater, target)
         
         if "error" in result:
@@ -151,7 +175,7 @@ def register_printer_tools(mcp):
         Args:
             pin: Admin PIN to authorize emergency stop
         """
-        if pin != config.ADMIN_PIN:
+        if not verify_pin(pin, config.ADMIN_PIN):
             return json.dumps({"error": "Invalid PIN. Emergency stop not executed."})
         
         client = get_client()
@@ -210,18 +234,24 @@ def register_printer_tools(mcp):
     
     @mcp.tool()
     async def pause_print() -> str:
-        """Pause the current print job."""
+        """Pause the current print job. REQUIRES: System must be ARMED."""
+        if not config.ARMED:
+            return json.dumps({"error": "System not ARMED."})
+
         client = get_client()
         result = await client.pause_print()
-        
+
         if "error" in result:
             return json.dumps({"error": result["error"]})
-        
+
         return json.dumps({"success": True, "state": "paused"})
-    
+
     @mcp.tool()
     async def resume_print() -> str:
-        """Resume a paused print job."""
+        """Resume a paused print job. REQUIRES: System must be ARMED."""
+        if not config.ARMED:
+            return json.dumps({"error": "System not ARMED."})
+
         client = get_client()
         result = await client.resume_print()
         

@@ -4,18 +4,21 @@ Compatible with Python 3.9+ (CB1/Raspberry Pi)
 Run with: python server.py
 """
 import asyncio
+import copy
 import inspect
 import json
 import os
+import re
 import sys
 import traceback
 from datetime import datetime
 from aiohttp import web
-from typing import Any, Callable, Dict, get_type_hints
+from typing import Any, Callable, Dict, get_type_hints, get_origin, get_args
 import html
 
 import config
 from moonraker import init_client, close_client, get_client
+from tools.security import verify_pin
 
 
 # ============================================================
@@ -128,6 +131,20 @@ def error_html(title: str, error: str) -> str:
         </section>
     ''')
 
+
+# ============================================================
+# Authentication
+# ============================================================
+
+def check_api_key(request: web.Request) -> bool:
+    """Check the X-API-Key header against config.API_KEY. No key configured = auth disabled (dev mode)."""
+    expected = getattr(config, "API_KEY", None)
+    if not expected:
+        return True
+    provided = request.headers.get("X-API-Key")
+    return verify_pin(provided, expected)
+
+
 # Tool registry
 TOOLS: Dict[str, Dict[str, Any]] = {}
 
@@ -144,18 +161,69 @@ def get_tool_description(tool_info):
     return "No description available"
 
 
+_ARGS_HEADER_RE = re.compile(r'^\s*Args:\s*$')
+_ARG_LINE_RE = re.compile(r'^\s+(\w+)\s*:\s*(.*)$')
+
+
+def parse_docstring_args(doc: str) -> Dict[str, str]:
+    """
+    Parse a Google-style 'Args:' section out of a docstring into {param_name: description}.
+    Best-effort: if no Args section is found, or its format doesn't match, returns {}.
+    """
+    try:
+        if not doc:
+            return {}
+        lines = doc.split('\n')
+        args = {}
+        in_args = False
+        for line in lines:
+            if not in_args:
+                if _ARGS_HEADER_RE.match(line):
+                    in_args = True
+                continue
+            if not line.strip():
+                break
+            match = _ARG_LINE_RE.match(line)
+            if not match:
+                break
+            args[match.group(1)] = match.group(2).strip()
+        return args
+    except Exception:
+        return {}
+
+
+_PIN_KEY_RE = re.compile(r'^pin$|_pin$', re.IGNORECASE)
+
+
+def _redact_pins(value):
+    """Recursively redact any dict key (case-insensitive) equal to 'pin' or ending in '_pin'."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, val in value.items():
+            if isinstance(key, str) and _PIN_KEY_RE.search(key.lower()):
+                redacted[key] = "***REDACTED***"
+            else:
+                redacted[key] = _redact_pins(val)
+        return redacted
+    elif isinstance(value, list):
+        return [_redact_pins(item) for item in value]
+    else:
+        return value
+
 
 def audit_log(action: str, details: dict = None):
     """Write to audit log for security tracking."""
     log_path = getattr(config, 'AUDIT_LOG_FILE', '/home/biqu/klipper-mcp/data/audit.log')
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    
+
+    safe_details = _redact_pins(copy.deepcopy(details)) if details else {}
+
     entry = {
         "timestamp": datetime.now().isoformat(),
         "action": action,
-        "details": details or {}
+        "details": safe_details
     }
-    
+
     try:
         with open(log_path, 'a') as f:
             f.write(json.dumps(entry) + '\n')
@@ -211,11 +279,14 @@ async def handle_list_tools(request: web.Request) -> web.Response:
 
 async def handle_call_tool(request: web.Request) -> web.Response:
     """Call a specific tool."""
+    if not check_api_key(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
     try:
         data = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
-    
+
     tool_name = data.get("tool") or data.get("name")
     arguments = data.get("arguments", {}) or data.get("params", {})
     
@@ -241,11 +312,24 @@ async def handle_call_tool(request: web.Request) -> web.Response:
         else:
             result = func(**arguments)
         
+        if isinstance(result, str):
+            try:
+                parsed_result = json.loads(result)
+            except (ValueError, TypeError):
+                parsed_result = result
+        else:
+            parsed_result = result
+
+        if isinstance(parsed_result, dict) and parsed_result.get("__mcp_image__"):
+            parsed_result = dict(parsed_result)
+            data_len = len(parsed_result.get("data", "") or "")
+            parsed_result["data"] = f"<{data_len} bytes of base64 image data omitted from JSON response>"
+
         return web.json_response({
             "tool": tool_name,
-            "result": json.loads(result) if isinstance(result, str) else result
+            "result": parsed_result
         })
-    
+
     except TypeError as e:
         return web.json_response({
             "error": f"Invalid arguments: {str(e)}",
@@ -291,11 +375,11 @@ async def handle_printer_status(request: web.Request) -> web.Response:
         print_stats = status.get("print_stats", {})
         extruder = status.get("extruder", {})
         bed = status.get("heater_bed", {})
-        
+
         return web.json_response({
             "state": print_stats.get("state"),
             "filename": print_stats.get("filename"),
-            "progress": print_stats.get("progress", 0),
+            "progress": status.get("virtual_sdcard", {}).get("progress", 0),
             "temperatures": {
                 "extruder": {
                     "current": extruder.get("temperature"),
@@ -390,7 +474,7 @@ async def handle_printer_status_html(request: web.Request) -> web.Response:
         state = print_stats.get("state", "unknown")
         state_class = "status-ok" if state in ["standby", "printing", "complete"] else "status-error" if state == "error" else ""
         
-        progress = print_stats.get("progress", 0) or 0
+        progress = status.get("virtual_sdcard", {}).get("progress", 0) or 0
         
         body = f'''
         <section>
@@ -558,13 +642,15 @@ async def handle_health_html(request: web.Request) -> web.Response:
 
 
 async def handle_call_tool_html(request: web.Request) -> web.Response:
-    """Call a tool and return HTML result."""
+    """
+    Show a form for a tool (GET, never executes) or execute it (POST, requires API key).
+    """
     tool_name = request.match_info.get('tool_name', '').replace('.html', '')
-    
+
     if not tool_name:
-        return web.Response(text=error_html("Tool Call", "No tool specified"), 
+        return web.Response(text=error_html("Tool Call", "No tool specified"),
                            content_type='text/html', status=400)
-    
+
     if tool_name not in TOOLS:
         body = f'''
         <section>
@@ -572,54 +658,73 @@ async def handle_call_tool_html(request: web.Request) -> web.Response:
             <p>This tool does not exist. <a href="/tools.html">View available tools</a></p>
         </section>
         '''
-        return web.Response(text=html_page("Tool Not Found", body), 
+        return web.Response(text=html_page("Tool Not Found", body),
                            content_type='text/html', status=404)
-    
+
     tool_info = TOOLS[tool_name]
     func = tool_info["function"]
-    
-    # Get arguments from query string
-    arguments = dict(request.query)
-    
-    # If no arguments provided, show a form
-    if not arguments and request.method == 'GET':
+
+    if request.method == "GET":
+        # GET never executes the tool - just show a pre-fillable form. Any query params
+        # present are used only to pre-fill input values, not to trigger execution.
+        query_args = dict(request.query)
         desc = tool_info["description"] or "No description available."
+        prefill_fields = "".join(
+            f'<p><label>{escape(key)}: <input type="text" name="{escape(key)}" value="{escape(value)}"></label></p>'
+            for key, value in query_args.items()
+        )
         body = f'''
         <section>
             <h2>Tool: {escape(tool_name)}</h2>
             <p>{escape(desc)}</p>
-            <form method="GET" action="/call/{escape(tool_name)}.html">
-                <p><em>Add query parameters to call with arguments, or click below to call without arguments:</em></p>
+            <form method="POST" action="/call/{escape(tool_name)}.html">
+                {prefill_fields}
+                <p><em>Add form fields to call with arguments, or click below to call without arguments:</em></p>
                 <button type="submit" style="padding:10px 20px; font-size:1.1em; cursor:pointer;">
                     Run {escape(tool_name)}
                 </button>
             </form>
-            <p style="margin-top:20px;"><small>Example: <code>/call/{escape(tool_name)}.html?param1=value1&param2=value2</code></small></p>
         </section>
         '''
         return web.Response(text=html_page(f"Tool: {tool_name}", body), content_type='text/html')
-    
+
+    # POST: this executes the tool - requires a valid API key.
+    if not check_api_key(request):
+        return web.Response(text=error_html(f"Tool: {tool_name}", "Unauthorized: missing or invalid X-API-Key header"),
+                           content_type='text/html', status=401)
+
+    form = await request.post()
+    arguments = dict(form)
+
     audit_log("tool_call_html", {"tool": tool_name, "arguments": arguments})
-    
+
     try:
         if asyncio.iscoroutinefunction(func):
             result = await func(**arguments)
         else:
             result = func(**arguments)
-        
+
         # Parse JSON if string
         if isinstance(result, str):
             try:
                 result = json.loads(result)
             except:
                 pass
-        
-        # Render result
-        if isinstance(result, (dict, list)):
-            result_html = render_json_as_html(result)
+
+        # Image convention: render inline as an <img>, and don't dump the base64 blob into the raw JSON view.
+        if isinstance(result, dict) and result.get("__mcp_image__"):
+            mime_type = result.get("mime_type", "image/jpeg")
+            data = result.get("data", "") or ""
+            result_html = f'<img src="data:{escape(mime_type)};base64,{data}" style="max-width:100%;">'
+            raw_json_display = f"<{len(data)} bytes of base64 image data omitted from HTML response>"
         else:
-            result_html = f'<pre>{escape(str(result))}</pre>'
-        
+            # Render result
+            if isinstance(result, (dict, list)):
+                result_html = render_json_as_html(result)
+            else:
+                result_html = f'<pre>{escape(str(result))}</pre>'
+            raw_json_display = json.dumps(result, indent=2) if isinstance(result, (dict, list)) else str(result)
+
         body = f'''
         <section>
             <h2>Tool: {escape(tool_name)}</h2>
@@ -631,18 +736,18 @@ async def handle_call_tool_html(request: web.Request) -> web.Response:
         </section>
         <section>
             <h3>Raw JSON</h3>
-            <pre>{escape(json.dumps(result, indent=2) if isinstance(result, (dict, list)) else str(result))}</pre>
+            <pre>{escape(raw_json_display)}</pre>
         </section>
         '''
-        
+
         return web.Response(text=html_page(f"Result: {tool_name}", body), content_type='text/html')
-    
+
     except TypeError as e:
-        return web.Response(text=error_html(f"Tool: {tool_name}", f"Invalid arguments: {e}"), 
+        return web.Response(text=error_html(f"Tool: {tool_name}", f"Invalid arguments: {e}"),
                            content_type='text/html', status=400)
     except Exception as e:
         traceback.print_exc()
-        return web.Response(text=error_html(f"Tool: {tool_name}", str(e)), 
+        return web.Response(text=error_html(f"Tool: {tool_name}", str(e)),
                            content_type='text/html', status=500)
 
 
@@ -882,14 +987,25 @@ async def handle_mcp(request: web.Request) -> web.Response:
             "error": {"code": -32700, "message": "Parse error"},
             "id": None
         }, status=400)
-    
+
     method = data.get("method", "")
     params = data.get("params", {})
     request_id = data.get("id")
-    
+
+    if not check_api_key(request):
+        return web.json_response({
+            "jsonrpc": "2.0",
+            "error": {"code": -32001, "message": "Unauthorized"},
+            "id": request_id
+        }, status=401)
+
+    # JSON-RPC notifications (no "id") get no response at all per spec - not an error.
+    if request_id is None and (method.startswith("notifications/") or method == "notifications/initialized"):
+        return web.Response(status=204)
+
     result = None
     error = None
-    
+
     try:
         if method == "initialize":
             result = {
@@ -913,14 +1029,24 @@ async def handle_mcp(request: web.Request) -> web.Response:
                     hints = get_type_hints(func)
                 except Exception:
                     hints = {}
+                arg_docs = parse_docstring_args(tool_info.get("description", "") or "")
                 properties = {}
                 required = []
                 for param_name, param in sig.parameters.items():
-                    json_type = type_map.get(hints.get(param_name), "string")
-                    properties[param_name] = {"type": json_type}
+                    hint = hints.get(param_name)
+                    # Unwrap Optional[X] (i.e. Union[X, None]) to X before the type_map lookup.
+                    if get_origin(hint) is not None and type(None) in get_args(hint):
+                        non_none = [a for a in get_args(hint) if a is not type(None)]
+                        if len(non_none) == 1:
+                            hint = non_none[0]
+                    json_type = type_map.get(hint, "string")
+                    prop = {"type": json_type}
+                    if param_name in arg_docs:
+                        prop["description"] = arg_docs[param_name]
+                    properties[param_name] = prop
                     if param.default is inspect.Parameter.empty:
                         required.append(param_name)
-                input_schema = {"type": "object", "properties": properties}
+                input_schema = {"type": "object", "properties": properties, "additionalProperties": False}
                 if required:
                     input_schema["required"] = required
                 tools_list.append({
@@ -953,13 +1079,24 @@ async def handle_mcp(request: web.Request) -> web.Response:
                         tool_result = json.loads(tool_result)
                     except:
                         pass
-                
-                result = {
-                    "content": [{
-                        "type": "text",
-                        "text": json.dumps(tool_result, indent=2) if isinstance(tool_result, (dict, list)) else str(tool_result)
-                    }]
-                }
+
+                # Convention: a tool may return {"__mcp_image__": True, "data": <base64>, "mime_type": ...}
+                # to hand back binary image content instead of a giant base64 text blob.
+                if isinstance(tool_result, dict) and tool_result.get("__mcp_image__"):
+                    result = {
+                        "content": [{
+                            "type": "image",
+                            "data": tool_result["data"],
+                            "mimeType": tool_result.get("mime_type", "image/jpeg")
+                        }]
+                    }
+                else:
+                    result = {
+                        "content": [{
+                            "type": "text",
+                            "text": json.dumps(tool_result, indent=2) if isinstance(tool_result, (dict, list)) else str(tool_result)
+                        }]
+                    }
         
         elif method == "ping":
             result = {}
@@ -1026,6 +1163,7 @@ def create_app() -> web.Application:
     app.router.add_get("/config.html", handle_config_files_html)
     app.router.add_get("/config/{filepath:.+}.html", handle_config_file_html)
     app.router.add_get("/call/{tool_name}.html", handle_call_tool_html)
+    app.router.add_post("/call/{tool_name}.html", handle_call_tool_html)
     
     # Lifecycle hooks
     app.on_startup.append(on_startup)

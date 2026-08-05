@@ -6,6 +6,7 @@ import json
 from typing import Optional, List
 import config
 from moonraker import get_client
+from tools.security import sanitize_gcode_param
 
 
 def register_tmc_tools(mcp):
@@ -91,23 +92,33 @@ def register_tmc_tools(mcp):
         Returns:
             Result of the current change operation.
         """
+        if not config.ARMED:
+            return json.dumps({'error': 'System not ARMED. TMC current changes require ARMED=true.'}, indent=2)
+
         if not run_current and not hold_current:
             return json.dumps({'error': 'Must specify at least run_current or hold_current'}, indent=2)
-        
+
+        try:
+            stepper = sanitize_gcode_param(stepper, "stepper")
+        except ValueError as e:
+            return json.dumps({'error': str(e)}, indent=2)
+
         client = get_client()
-        
+
         # Build the gcode command
         cmd_parts = [f'SET_TMC_CURRENT STEPPER={stepper}']
         if run_current is not None:
             cmd_parts.append(f'CURRENT={run_current}')
         if hold_current is not None:
             cmd_parts.append(f'HOLDCURRENT={hold_current}')
-        
+
         gcode = ' '.join(cmd_parts)
-        
+
         try:
-            await client.run_gcode(gcode)
-            
+            result = await client.run_gcode(gcode)
+            if 'error' in result:
+                return json.dumps({'error': result['error'], 'command': gcode}, indent=2)
+
             # Query the new status
             objects_result = await client.get('/printer/objects/list')
             all_objects = objects_result.get('result', {}).get('objects', [])
@@ -116,11 +127,15 @@ def register_tmc_tools(mcp):
                 if obj.startswith('tmc') and stepper in obj:
                     tmc_obj = obj
                     break
-            
+
             if tmc_obj:
-                result = await client.get(f'/printer/objects/query?{tmc_obj.replace(" ", "%20")}')
-                new_status = result.get('result', {}).get('status', {}).get(tmc_obj, {})
-                
+                query_result = await client.get(f'/printer/objects/query?{tmc_obj.replace(" ", "%20")}')
+                if 'error' in query_result:
+                    # The current change itself succeeded even though this follow-up
+                    # status query failed - don't report the whole call as an error.
+                    return json.dumps({'success': True, 'stepper': stepper, 'command': gcode}, indent=2)
+                new_status = query_result.get('result', {}).get('status', {}).get(tmc_obj, {})
+
                 return json.dumps({
                     'success': True,
                     'stepper': stepper,
@@ -130,9 +145,9 @@ def register_tmc_tools(mcp):
                         'hold_current': round(new_status.get('hold_current', 0), 3)
                     }
                 }, indent=2)
-            
+
             return json.dumps({'success': True, 'command': gcode}, indent=2)
-            
+
         except Exception as e:
             return json.dumps({'error': str(e), 'command': gcode}, indent=2)
 
@@ -148,8 +163,16 @@ def register_tmc_tools(mcp):
         Returns:
             TMC register dump information.
         """
+        # DUMP_TMC is a read-only diagnostic command (prints register values to the
+        # console) - it does not change stepper current or any other hardware
+        # state, so no ARMED gate is required here.
+        try:
+            stepper = sanitize_gcode_param(stepper, "stepper")
+        except ValueError as e:
+            return json.dumps({'error': str(e)}, indent=2)
+
         client = get_client()
-        
+
         # Find the TMC object
         objects_result = await client.get('/printer/objects/list')
         all_objects = objects_result.get('result', {}).get('objects', [])
@@ -158,18 +181,20 @@ def register_tmc_tools(mcp):
             if obj.startswith('tmc') and stepper in obj:
                 tmc_obj = obj
                 break
-        
+
         if not tmc_obj:
             return json.dumps({'error': f'No TMC driver found for: {stepper}'}, indent=2)
-        
+
         driver_type = tmc_obj.split()[0].upper()
-        
+
         # Run DUMP_TMC command
         gcode = f'DUMP_TMC STEPPER={stepper}'
-        
+
         try:
-            await client.run_gcode(gcode)
-            
+            result = await client.run_gcode(gcode)
+            if 'error' in result:
+                return json.dumps({'error': result['error'], 'command': gcode}, indent=2)
+
             return json.dumps({
                 'success': True,
                 'stepper': stepper,
@@ -177,7 +202,7 @@ def register_tmc_tools(mcp):
                 'command': gcode,
                 'note': 'Register dump sent to console. Check Klipper console/logs for detailed register values.'
             }, indent=2)
-            
+
         except Exception as e:
             return json.dumps({'error': str(e)}, indent=2)
 
@@ -193,20 +218,57 @@ def register_tmc_tools(mcp):
         Returns:
             The field value.
         """
-        client = get_client()
-        
-        gcode = f'SET_TMC_FIELD STEPPER={stepper} FIELD={field}'
-        
+        # NOTE: Klipper's SET_TMC_FIELD command is write-only and requires a
+        # VALUE parameter - there is no G-code command to "read" a TMC field.
+        # The correct way to read a field is via the driver's printer object
+        # status (e.g. `tmc2209 stepper_x`), reusing the same object-lookup
+        # pattern as dump_tmc_registers/set_tmc_current above.
         try:
-            await client.run_gcode(gcode)
-            
+            stepper = sanitize_gcode_param(stepper, "stepper")
+            field = sanitize_gcode_param(field, "field")
+        except ValueError as e:
+            return json.dumps({'error': str(e)}, indent=2)
+
+        client = get_client()
+
+        objects_result = await client.get('/printer/objects/list')
+        all_objects = objects_result.get('result', {}).get('objects', [])
+        tmc_obj = None
+        for obj in all_objects:
+            if obj.startswith('tmc') and stepper in obj:
+                tmc_obj = obj
+                break
+
+        if not tmc_obj:
+            return json.dumps({'error': f'No TMC driver found for: {stepper}'}, indent=2)
+
+        try:
+            result = await client.get(f'/printer/objects/query?{tmc_obj.replace(" ", "%20")}')
+            if 'error' in result:
+                return json.dumps({'error': result['error']}, indent=2)
+
+            status = result.get('result', {}).get('status', {}).get(tmc_obj, {})
+            drv_status = status.get('drv_status') if isinstance(status.get('drv_status'), dict) else {}
+
+            if field in status:
+                value = status[field]
+            elif field in drv_status:
+                value = drv_status[field]
+            else:
+                return json.dumps({
+                    'error': f"Field '{field}' not found in printer object status for {tmc_obj}",
+                    'available_fields': sorted(status.keys()),
+                    'available_drv_status_fields': sorted(drv_status.keys())
+                }, indent=2)
+
             return json.dumps({
                 'success': True,
                 'stepper': stepper,
                 'field': field,
-                'note': 'Field value printed to console. Check Klipper console for the value.'
+                'value': value,
+                'source': tmc_obj
             }, indent=2)
-            
+
         except Exception as e:
             return json.dumps({'error': str(e)}, indent=2)
 
@@ -224,13 +286,24 @@ def register_tmc_tools(mcp):
         Returns:
             Result of the operation.
         """
-        client = get_client()
-        
-        gcode = f'SET_TMC_FIELD STEPPER={stepper} FIELD={field} VALUE={value}'
-        
+        if not config.ARMED:
+            return json.dumps({'error': 'System not ARMED. TMC field changes require ARMED=true.'}, indent=2)
+
         try:
-            await client.run_gcode(gcode)
-            
+            stepper = sanitize_gcode_param(stepper, "stepper")
+            field = sanitize_gcode_param(field, "field")
+        except ValueError as e:
+            return json.dumps({'error': str(e)}, indent=2)
+
+        client = get_client()
+
+        gcode = f'SET_TMC_FIELD STEPPER={stepper} FIELD={field} VALUE={value}'
+
+        try:
+            result = await client.run_gcode(gcode)
+            if 'error' in result:
+                return json.dumps({'error': result['error'], 'command': gcode}, indent=2)
+
             return json.dumps({
                 'success': True,
                 'stepper': stepper,
@@ -238,7 +311,7 @@ def register_tmc_tools(mcp):
                 'value': value,
                 'command': gcode
             }, indent=2)
-            
+
         except Exception as e:
             return json.dumps({'error': str(e)}, indent=2)
 

@@ -23,7 +23,7 @@ def register_gcode_analysis_tools(mcp):
         client = get_client()
         
         # Get metadata first (already parsed by slicer)
-        metadata = await client.get_gcode_metadata(filename)
+        metadata = await client.get_file_metadata(filename)
         
         if "error" in metadata:
             return json.dumps({"error": metadata["error"]})
@@ -77,19 +77,19 @@ def register_gcode_analysis_tools(mcp):
             limit: Maximum number of comments to extract (default: 100)
         """
         client = get_client()
-        session = await client._get_session()
-        
-        url = f"{client.base_url}/server/files/gcodes/{filename}"
-        
+
+        # A comment extraction has no way to know up front where the comments
+        # of interest live (many slicers interleave per-line comments like
+        # ";TYPE:WALL-INNER" throughout the whole file, not just head/tail),
+        # so a full read is still required here.
         try:
-            async with session.get(url) as response:
-                if response.status == 404:
-                    return json.dumps({"error": f"File not found: {filename}"})
-                response.raise_for_status()
-                content = await response.text()
+            content = await client.get_file_content_range("gcodes", filename)
         except Exception as e:
+            status = getattr(e, "status", None)
+            if status == 404:
+                return json.dumps({"error": f"File not found: {filename}"})
             return json.dumps({"error": str(e)})
-        
+
         comments = []
         for line in content.split('\n'):
             line = line.strip()
@@ -119,19 +119,18 @@ def register_gcode_analysis_tools(mcp):
             filename: Name of the G-code file
         """
         client = get_client()
-        session = await client._get_session()
-        
-        url = f"{client.base_url}/server/files/gcodes/{filename}"
-        
+
+        # Move statistics require scanning every G0/G1/G2/G3 line in the
+        # file, so there's no reasonable byte range to narrow this to - a
+        # full read is unavoidable here.
         try:
-            async with session.get(url) as response:
-                if response.status == 404:
-                    return json.dumps({"error": f"File not found: {filename}"})
-                response.raise_for_status()
-                content = await response.text()
+            content = await client.get_file_content_range("gcodes", filename)
         except Exception as e:
+            status = getattr(e, "status", None)
+            if status == 404:
+                return json.dumps({"error": f"File not found: {filename}"})
             return json.dumps({"error": str(e)})
-        
+
         stats = {
             "g0_moves": 0,  # Travel
             "g1_moves": 0,  # Linear with potential extrusion
@@ -206,19 +205,17 @@ def register_gcode_analysis_tools(mcp):
             context_lines: Number of lines to show around match (default: 10)
         """
         client = get_client()
-        session = await client._get_session()
-        
-        url = f"{client.base_url}/server/files/gcodes/{filename}"
-        
+
+        # Free-text search has no way to know where a match will be without
+        # scanning the whole file, so a full read is unavoidable here.
         try:
-            async with session.get(url) as response:
-                if response.status == 404:
-                    return json.dumps({"error": f"File not found: {filename}"})
-                response.raise_for_status()
-                content = await response.text()
+            content = await client.get_file_content_range("gcodes", filename)
         except Exception as e:
+            status = getattr(e, "status", None)
+            if status == 404:
+                return json.dumps({"error": f"File not found: {filename}"})
             return json.dumps({"error": str(e)})
-        
+
         lines = content.split('\n')
         search_lower = search_text.lower()
         
@@ -259,21 +256,24 @@ def register_gcode_analysis_tools(mcp):
             layer_number: Layer number to extract (1-based)
         """
         client = get_client()
-        session = await client._get_session()
-        
-        url = f"{client.base_url}/server/files/gcodes/{filename}"
-        
+
+        # Layer markers could in principle be located via a proportional
+        # byte-offset estimate (layer_number / layer_count * file_size), but
+        # slicers don't emit uniform-size layers and marker formats vary
+        # (0- vs 1-indexed, different comment styles), so a wrong estimate
+        # would silently return the wrong layer or incorrect line numbers.
+        # Without a precomputed layer->byte-offset index this isn't safely
+        # narrowable, so a full read is used here.
         try:
-            async with session.get(url) as response:
-                if response.status == 404:
-                    return json.dumps({"error": f"File not found: {filename}"})
-                response.raise_for_status()
-                content = await response.text()
+            content = await client.get_file_content_range("gcodes", filename)
         except Exception as e:
+            status = getattr(e, "status", None)
+            if status == 404:
+                return json.dumps({"error": f"File not found: {filename}"})
             return json.dumps({"error": str(e)})
-        
+
         lines = content.split('\n')
-        
+
         # Find layer markers (common patterns)
         layer_patterns = [
             rf';LAYER:{layer_number}',  # Cura
@@ -324,29 +324,62 @@ def register_gcode_analysis_tools(mcp):
     async def validate_gcode(filename: str) -> str:
         """
         Validate G-code file for common issues.
-        
+
         Args:
             filename: Name of the G-code file to validate
         """
         client = get_client()
-        session = await client._get_session()
-        
-        url = f"{client.base_url}/server/files/gcodes/{filename}"
-        
+
+        # Only the first ~500 lines and last ~100 lines are actually inspected
+        # below, so for large files fetch bounded head/tail byte ranges via
+        # get_file_content_range() instead of downloading the whole file.
+        HEAD_BYTES = 65536   # comfortably covers 500 lines of gcode
+        TAIL_BYTES = 16384   # comfortably covers 100 lines of gcode
+
+        file_size = None
+        metadata = await client.get_file_metadata(filename)
+        if "error" not in metadata:
+            file_size = metadata.get("result", {}).get("size")
+
         try:
-            async with session.get(url) as response:
-                if response.status == 404:
-                    return json.dumps({"error": f"File not found: {filename}"})
-                response.raise_for_status()
-                content = await response.text()
+            if file_size and file_size > HEAD_BYTES + TAIL_BYTES:
+                head_content = await client.get_file_content_range(
+                    "gcodes", filename, start=0, end=HEAD_BYTES - 1
+                )
+                tail_start = max(file_size - TAIL_BYTES, HEAD_BYTES)
+                tail_content = await client.get_file_content_range(
+                    "gcodes", filename, start=tail_start
+                )
+
+                head_lines = head_content.split('\n')[:500]
+                tail_lines_all = tail_content.split('\n')
+                # The tail range almost certainly starts mid-line; drop the
+                # (possibly partial) first line of the tail chunk.
+                if len(tail_lines_all) > 1:
+                    tail_lines_all = tail_lines_all[1:]
+                tail_lines = tail_lines_all[-100:]
+
+                sample_line_count = len(head_lines) + len(tail_lines_all)
+                sample_byte_count = len(head_content) + len(tail_content)
+                avg_bytes_per_line = (sample_byte_count / sample_line_count) if sample_line_count else 1
+                total_lines = int(file_size / avg_bytes_per_line) if avg_bytes_per_line else 0
+                total_lines_exact = False
+            else:
+                content = await client.get_file_content_range("gcodes", filename)
+                all_lines = content.split('\n')
+                head_lines = all_lines[:500]
+                tail_lines = all_lines[-100:]
+                total_lines = len(all_lines)
+                total_lines_exact = True
         except Exception as e:
+            status = getattr(e, "status", None)
+            if status == 404:
+                return json.dumps({"error": f"File not found: {filename}"})
             return json.dumps({"error": str(e)})
-        
-        lines = content.split('\n')
-        
+
         issues = []
         warnings = []
-        
+
         has_start_gcode = False
         has_end_gcode = False
         has_home = False
@@ -354,10 +387,10 @@ def register_gcode_analysis_tools(mcp):
         has_bed_temp = False
         max_temp = 0
         max_bed_temp = 0
-        
-        for i, line in enumerate(lines[:500]):  # Check first 500 lines
+
+        for i, line in enumerate(head_lines):  # Check first 500 lines
             line_upper = line.strip().upper()
-            
+
             if line_upper.startswith('G28'):
                 has_home = True
             elif line_upper.startswith(('M104', 'M109')):
@@ -376,26 +409,26 @@ def register_gcode_analysis_tools(mcp):
                     max_bed_temp = max(max_bed_temp, temp)
                     if temp > 120:
                         warnings.append(f"Line {i+1}: High bed temp: {temp}°C")
-            
+
             # Check for start gcode marker
             if 'START' in line_upper and 'GCODE' in line_upper:
                 has_start_gcode = True
-        
+
         # Check last 100 lines for end gcode
-        for i, line in enumerate(lines[-100:]):
+        for i, line in enumerate(tail_lines):
             if 'END' in line.upper() and 'GCODE' in line.upper():
                 has_end_gcode = True
                 break
             if line.strip().upper() in ['M84', 'M104 S0', 'M140 S0']:
                 has_end_gcode = True
-        
+
         # Compile validation results
         if not has_home:
             warnings.append("No G28 homing command found in first 500 lines")
-        
+
         if not has_temp_set:
             issues.append("No hotend temperature command found")
-        
+
         return json.dumps({
             "filename": filename,
             "valid": len(issues) == 0,
@@ -410,7 +443,8 @@ def register_gcode_analysis_tools(mcp):
             },
             "issues": issues,
             "warnings": warnings,
-            "total_lines": len(lines)
+            "total_lines": total_lines,
+            "total_lines_exact": total_lines_exact,
         }, indent=2)
 
 

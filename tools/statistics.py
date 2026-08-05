@@ -7,37 +7,57 @@ from typing import Optional
 import config
 from moonraker import get_client
 
+# Mass per mm of length for common 1.75mm filament (e.g. PLA), derived from
+# density x cross-sectional area rather than density alone:
+#   cross-section area = pi * (1.75mm / 2)^2 ~= 2.405 mm^2
+#   mass per mm = 2.405 mm^2 * 0.00124 g/mm^3 (PLA density) ~= 0.00298 g/mm
+# The previous constant (0.00125) was PLA's density in g/mm^3, not mass-per-mm -
+# using it directly undercounted filament mass by roughly 2.4x. This is a
+# single, material-agnostic-ish approximation for the overwhelmingly common
+# 1.75mm/PLA case; it is not correct for other diameters or very different
+# density materials (e.g. PETG, ABS, or 2.85mm filament).
+FILAMENT_MASS_PER_MM_1_75 = 0.00298
+
 
 def register_statistics_tools(mcp):
     """Register print statistics tools."""
-    
+
     @mcp.tool()
     async def get_print_history(limit: int = 20, status_filter: Optional[str] = None) -> str:
         """
         Get print job history.
-        
+
         Args:
             limit: Number of jobs to return (default: 20, max: 100)
             status_filter: Filter by status - 'completed', 'cancelled', 'error' (optional)
         """
         limit = min(limit, 100)
-        
+
+        # moonraker.py's get_print_history() only supports limit/start pagination - there's
+        # no server-side status filter available through this client method (Moonraker's
+        # /server/history/list does support since/before/order query params that could
+        # narrow this properly, but adding them requires a moonraker.py change, which is
+        # out of scope here). When filtering by status, fetch a larger batch first so
+        # non-matching jobs inside the window don't silently shrink the result below
+        # `limit` - then trim to `limit` after filtering.
+        fetch_limit = max(limit * 5, 200) if status_filter else limit
+
         client = get_client()
-        result = await client.get_print_history(limit=limit)
-        
+        result = await client.get_print_history(limit=fetch_limit)
+
         if "error" in result:
             return json.dumps({"error": result["error"]})
-        
+
         data = result.get("result", {})
         jobs = data.get("jobs", [])
-        
+
         formatted_jobs = []
         for job in jobs:
             # Apply status filter if specified
             job_status = job.get("status", "")
             if status_filter and job_status != status_filter:
                 continue
-            
+
             formatted_jobs.append({
                 "id": job.get("job_id"),
                 "filename": job.get("filename"),
@@ -47,9 +67,12 @@ def register_statistics_tools(mcp):
                 "print_duration": format_duration(job.get("print_duration")),
                 "total_duration": format_duration(job.get("total_duration")),
                 "filament_used_mm": round(job.get("filament_used", 0), 1),
-                "filament_used_g": round(job.get("filament_used", 0) * 0.00125, 2),  # Approximate
+                "filament_used_g": round(job.get("filament_used", 0) * FILAMENT_MASS_PER_MM_1_75, 2),  # Approximate, assumes 1.75mm PLA
             })
-        
+
+            if len(formatted_jobs) >= limit:
+                break
+
         return json.dumps({
             "total_count": data.get("count", 0),
             "returned": len(formatted_jobs),
@@ -83,7 +106,7 @@ def register_statistics_tools(mcp):
             "total_filament_used": {
                 "mm": round(data.get("total_filament_used", 0), 1),
                 "meters": round(data.get("total_filament_used", 0) / 1000, 2),
-                "grams_approx": round(data.get("total_filament_used", 0) * 0.00125, 1),  # Approximate
+                "grams_approx": round(data.get("total_filament_used", 0) * FILAMENT_MASS_PER_MM_1_75, 1),  # Approximate, assumes 1.75mm PLA
             },
             "longest_job": {
                 "seconds": data.get("longest_job", 0),
@@ -168,7 +191,7 @@ def register_statistics_tools(mcp):
             "total_filament": {
                 "mm": round(total_filament, 1),
                 "meters": round(total_filament / 1000, 2),
-                "grams_approx": round(total_filament * 0.00125, 1),
+                "grams_approx": round(total_filament * FILAMENT_MASS_PER_MM_1_75, 1),  # Approximate, assumes 1.75mm PLA
             },
             "completed_prints": {
                 "count": completed_count,
@@ -191,15 +214,21 @@ def register_statistics_tools(mcp):
             hours: Number of hours to look back (default: 24)
         """
         import time
-        
+
         client = get_client()
-        result = await client.get_print_history(limit=50)
-        
+        # moonraker.py's get_print_history() has no since/before filter (see note in
+        # get_print_history above), so a fixed limit is the only way to bound this query.
+        # 50 silently missed anything beyond the 50 most recent jobs; 500 is a pragmatic
+        # increase but still not a real guarantee of completeness for a long `hours`
+        # window on a busy printer - a proper fix needs since/before support added to
+        # moonraker.py's get_print_history().
+        result = await client.get_print_history(limit=500)
+
         if "error" in result:
             return json.dumps({"error": result["error"]})
-        
+
         jobs = result.get("result", {}).get("jobs", [])
-        
+
         cutoff_time = time.time() - (hours * 3600)
         
         recent_jobs = []
@@ -225,13 +254,16 @@ def register_statistics_tools(mcp):
         Calculate average print statistics from job history.
         """
         client = get_client()
-        result = await client.get_print_history(limit=50)
-        
+        # See note in get_print_history/get_recent_prints: no since/before support in
+        # moonraker.py's client method, so a generous fixed limit is a pragmatic
+        # mitigation rather than a full fix for completeness.
+        result = await client.get_print_history(limit=500)
+
         if "error" in result:
             return json.dumps({"error": result["error"]})
-        
+
         jobs = result.get("result", {}).get("jobs", [])
-        
+
         # Filter completed jobs only
         completed = [j for j in jobs if j.get("status") == "completed"]
         
@@ -253,7 +285,7 @@ def register_statistics_tools(mcp):
             },
             "average_filament_per_print": {
                 "mm": round(avg_filament, 1),
-                "grams_approx": round(avg_filament * 0.00125, 2),
+                "grams_approx": round(avg_filament * FILAMENT_MASS_PER_MM_1_75, 2),  # Approximate, assumes 1.75mm PLA
             },
             "total_analyzed": len(jobs),
             "completed_count": len(completed),

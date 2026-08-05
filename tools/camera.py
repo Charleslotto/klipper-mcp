@@ -13,30 +13,63 @@ def register_camera_tools(mcp):
     """Register camera and timelapse tools."""
     
     @mcp.tool()
-    async def capture_snapshot() -> str:
+    async def capture_snapshot(webcam_name: Optional[str] = None) -> dict:
         """
         Capture a snapshot from the webcam.
-        Returns the image as a base64-encoded string.
+        Returns the image as MCP image content (not a base64 text blob).
+
+        Args:
+            webcam_name: Optional name of a specific webcam to snapshot (see
+                get_camera_stream_url for configured webcam names). If omitted,
+                the default configured camera is used.
         """
         client = get_client()
-        
-        image_bytes = await client.get_webcam_snapshot()
-        
+
+        image_bytes = None
+
+        if webcam_name:
+            # Multi-camera setups: look up the specific webcam's snapshot URL
+            # from Moonraker's webcam list and hit it directly, since the
+            # client's default get_webcam_snapshot() only knows about the
+            # single configured CAMERA_SNAPSHOT_URL.
+            webcam_list = await client.get_webcam_list()
+            snapshot_url = None
+            for cam in webcam_list.get("result", {}).get("webcams", []):
+                if cam.get("name") == webcam_name:
+                    snapshot_url = cam.get("snapshot_url")
+                    break
+
+            if snapshot_url is None:
+                return json.dumps({
+                    "error": f"Webcam not found: {webcam_name}",
+                    "hint": "Use get_camera_stream_url to list configured webcam names."
+                })
+
+            session = await client._get_session()
+            try:
+                async with session.get(snapshot_url) as response:
+                    response.raise_for_status()
+                    image_bytes = await response.read()
+            except Exception as e:
+                return json.dumps({"error": f"Failed to capture snapshot from '{webcam_name}': {str(e)}"})
+        else:
+            image_bytes = await client.get_webcam_snapshot()
+
         if image_bytes is None:
             return json.dumps({
                 "error": "Failed to capture snapshot. Check camera configuration.",
                 "camera_url": config.CAMERA_SNAPSHOT_URL
             })
-        
-        # Encode as base64
+
+        # Encode as base64 and hand back via the MCP image-content convention
+        # instead of embedding the blob in a JSON/text response.
         b64_image = base64.b64encode(image_bytes).decode('utf-8')
-        
-        return json.dumps({
-            "success": True,
-            "format": "jpeg",
-            "size_bytes": len(image_bytes),
-            "image_base64": b64_image
-        })
+
+        return {
+            "__mcp_image__": True,
+            "data": b64_image,
+            "mime_type": "image/jpeg"
+        }
     
     @mcp.tool()
     async def get_camera_stream_url() -> str:
@@ -200,7 +233,7 @@ def register_camera_tools(mcp):
         
         timelapses = []
         for f in files:
-            filename = f.get("filename", "")
+            filename = f.get("path") or f.get("filename", "")
             if filename.endswith(('.mp4', '.webm', '.mkv')):
                 timelapses.append({
                     "filename": filename,

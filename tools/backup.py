@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Optional
 import config
 from moonraker import get_client
+from tools.security import verify_pin
+from tools.filesystem import upload_to_moonraker
 
 
 def register_backup_tools(mcp):
@@ -54,13 +56,13 @@ def register_backup_tools(mcp):
         # Create backup directory name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_name = backup_name or f"backup_{timestamp}"
-        backup_dir = f"config_backups/{backup_name}"
-        
+
         backed_up_files = []
-        
+        failed_files = []
+
         # Copy each config file to backup
         session = await client._get_session()
-        
+
         for file_info in files:
             filename = file_info.get("path", file_info.get("filename", ""))
             if filename.endswith(('.cfg', '.conf')):
@@ -70,23 +72,32 @@ def register_backup_tools(mcp):
                     async with session.get(url) as response:
                         if response.status == 200:
                             content = await response.text()
-                            
-                            # Save to backup location
+
+                            # Save to backup location (os.makedirs handles nested
+                            # paths like "Toolheads/T0.cfg" so subdirectories
+                            # under config are preserved, not silently dropped)
                             backup_path = os.path.join(config.BACKUP_PATH, backup_name, filename)
                             os.makedirs(os.path.dirname(backup_path), exist_ok=True)
                             with open(backup_path, 'w') as f:
                                 f.write(content)
-                            
+
                             backed_up_files.append(filename)
+                        else:
+                            failed_files.append({
+                                "filename": filename,
+                                "error": f"HTTP {response.status} fetching file"
+                            })
                 except Exception as e:
-                    pass  # Continue with other files
-        
+                    failed_files.append({"filename": filename, "error": str(e)})
+
         return json.dumps({
-            "success": True,
+            "success": len(failed_files) == 0,
             "backup_name": backup_name,
             "backup_path": os.path.join(config.BACKUP_PATH, backup_name),
             "files_backed_up": backed_up_files,
-            "file_count": len(backed_up_files)
+            "file_count": len(backed_up_files),
+            "failed_files": failed_files if failed_files else None,
+            "failed_count": len(failed_files)
         }, indent=2)
     
     @mcp.tool()
@@ -126,41 +137,46 @@ def register_backup_tools(mcp):
             backup_name: Name of the backup to restore
             admin_pin: Admin PIN for authorization
         """
-        if admin_pin != config.ADMIN_PIN:
+        if not verify_pin(admin_pin, config.ADMIN_PIN):
             return json.dumps({"error": "Invalid admin PIN"})
-        
+
         backup_path = os.path.join(config.BACKUP_PATH, backup_name)
-        
+
         if not os.path.exists(backup_path):
             return json.dumps({"error": f"Backup '{backup_name}' not found"})
-        
+
         client = get_client()
-        session = await client._get_session()
-        
+
         restored_files = []
         errors = []
-        
-        for filename in os.listdir(backup_path):
-            if filename.endswith(('.cfg', '.conf')):
-                file_path = os.path.join(backup_path, filename)
+
+        # Walk recursively so nested config files (e.g. "Toolheads/T0.cfg")
+        # backed up by backup_config are actually restored, not silently
+        # skipped the way a top-level os.listdir() would skip them.
+        for dirpath, _dirnames, filenames in os.walk(backup_path):
+            rel_dir = os.path.relpath(dirpath, backup_path)
+            for filename in filenames:
+                if not filename.endswith(('.cfg', '.conf')):
+                    continue
+                relative_path = filename if rel_dir == "." else os.path.join(rel_dir, filename)
+                # Normalize to forward slashes for Moonraker's path field
+                relative_path = relative_path.replace(os.sep, "/")
+                file_path = os.path.join(dirpath, filename)
                 try:
                     with open(file_path, 'r') as f:
                         content = f.read()
-                    
-                    # Upload via Moonraker
-                    url = f"{client.base_url}/server/files/upload"
-                    data = aiohttp.FormData()
-                    data.add_field('file', content, filename=filename, content_type='text/plain')
-                    data.add_field('root', 'config')
-                    
-                    async with session.post(url, data=data) as response:
-                        if response.status == 201:
-                            restored_files.append(filename)
-                        else:
-                            errors.append({"file": filename, "error": f"Upload failed: {response.status}"})
+
+                    # Upload via Moonraker, preserving the original subdirectory
+                    # (same root+path fix as tools/filesystem.py's write_file).
+                    result = await upload_to_moonraker(client, "config", relative_path, content)
+
+                    if "error" in result:
+                        errors.append({"file": relative_path, "error": result["error"]})
+                    else:
+                        restored_files.append(relative_path)
                 except Exception as e:
-                    errors.append({"file": filename, "error": str(e)})
-        
+                    errors.append({"file": relative_path, "error": str(e)})
+
         return json.dumps({
             "success": len(errors) == 0,
             "backup_restored": backup_name,
@@ -355,7 +371,3 @@ def register_backup_tools(mcp):
                 "maintenance_log"
             ]
         }, indent=2)
-
-
-# Import aiohttp for file upload
-import aiohttp
