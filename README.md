@@ -241,7 +241,14 @@ nano ~/klipper-mcp/config.py
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `ARMED` | Enable dangerous operations | `false` |
+| `READ_ONLY` | Hard-block all state-changing tools (overrides `ARMED`) | `false` |
 | `ADMIN_PIN` | PIN for destructive ops | `123456` |
+
+**File path settings:**
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `PRINTER_DATA_PATH` | Full path to your `printer_data` directory | `~/printer_data` |
+| `KLIPPER_DATA_DIR` | Alternate override for the `printer_data` base | `~/printer_data` |
 
 **Optional integrations:**
 | Setting | Description |
@@ -335,6 +342,20 @@ Configure multiple printers in settings.json:
 ### ARMED Flag
 Dangerous operations (G-code execution, temperature changes) require `ARMED=True` in config.
 
+### Read-Only Mode
+Set `READ_ONLY=True` (or `READ_ONLY=true` as an environment variable) for a hard
+"look but don't touch" lock. When enabled, the server blocks **every** state-changing
+tool at the request boundary — before the tool runs — and only allows read/query
+tools (`get_*`, `list_*`, `read_*`, `check_*`, `analyze_*`, `diagnose_*`, etc.).
+
+- Enforced server-side and **fails closed**: any tool not recognized as read-only is
+  denied, so it can never move, heat, or reconfigure the printer.
+- Overrides `ARMED` — even if `ARMED=True`, read-only stays locked.
+- Blocked calls return an error and are recorded in the audit log as `blocked_read_only`.
+
+This is ideal when you want an assistant to inspect and troubleshoot the printer
+without any risk of it issuing a destructive command.
+
 ### Admin PIN
 Destructive operations (file deletion, config restore, system reboot) require the admin PIN.
 
@@ -361,6 +382,7 @@ MCP_TRANSPORT = "http"  # or "stdio" for local use
 # Security
 API_KEY = "your-secret-key"        # Required for all API calls
 ARMED = False                       # Set True to enable dangerous ops
+READ_ONLY = False                   # Set True to hard-block all state changes
 ADMIN_PIN = "1234"                  # For destructive operations
 
 # Camera
@@ -623,6 +645,28 @@ For automatic TMC tuning, install [klipper_tmc_autotune](https://github.com/andr
 
 ### LED Effects
 For animated LEDs, install [klipper-led_effect](https://github.com/julianschill/klipper-led_effect).
+
+### Moonraker Update Manager
+The installer registers `klipper-mcp` in `~/printer_data/moonraker.asvc` so Moonraker
+can manage and restart the service after updates. To also get **git-based updates**
+through the Mainsail/Fluidd update manager, add this block to your `moonraker.conf`:
+
+```ini
+[update_manager klipper-mcp]
+type: git_repo
+path: ~/klipper-mcp
+origin: https://github.com/Charleslotto/klipper-mcp.git
+primary_branch: main
+managed_services: klipper-mcp
+virtualenv: ~/klipper-mcp/venv
+requirements: requirements.txt
+```
+
+After adding it, restart Moonraker (`sudo systemctl restart moonraker`). klipper-mcp
+will then appear alongside Klipper, Moonraker, and KlipperScreen in your update
+manager, and you can update it with a single click. This block is left as a manual
+step because `moonraker.conf` varies too much between installs to edit safely from a
+script.
 
 ## Troubleshooting
 

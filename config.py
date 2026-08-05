@@ -29,6 +29,10 @@ API_KEY = os.getenv("API_KEY", "change-me-to-a-secure-key")
 # Armed mode - when False, dangerous commands are blocked
 ARMED = os.getenv("ARMED", "true").lower() == "true"
 
+# Read-only mode - when True, ALL state-changing tools are blocked at the
+# server, regardless of ARMED. A hard safety lock: only read/query tools run.
+READ_ONLY = os.getenv("READ_ONLY", "false").lower() == "true"
+
 # Admin PIN for destructive operations (delete, restore, emergency stop)
 ADMIN_PIN = os.getenv("ADMIN_PIN", "123456")
 

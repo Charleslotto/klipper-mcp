@@ -44,6 +44,12 @@ API_KEY = os.getenv("API_KEY", "CHANGE-ME-TO-A-SECURE-KEY")
 # Set to True once you've verified everything works
 ARMED = os.getenv("ARMED", "false").lower() == "true"
 
+# Read-only mode - when True, ALL state-changing tools are blocked at the
+# server regardless of ARMED (a hard safety lock). Only read/query tools run,
+# so the assistant can inspect the printer but can never move or change it.
+# Useful for a "look but don't touch" setup. Overrides ARMED when enabled.
+READ_ONLY = os.getenv("READ_ONLY", "false").lower() == "true"
+
 # Admin PIN for destructive operations (delete files, restore config, reboot)
 ADMIN_PIN = os.getenv("ADMIN_PIN", "123456")
 

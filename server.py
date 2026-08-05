@@ -93,6 +93,7 @@ def html_page(title: str, body: str, subtitle: str = None) -> str:
         tr:nth-child(even) {{ background: #f9f9f9; }}
         .status-ok {{ color: green; font-weight: bold; }}
         .status-error {{ color: red; font-weight: bold; }}
+        .status-warn {{ color: #d17b00; font-weight: bold; }}
         .temp {{ font-size: 1.2em; }}
         .tool-card {{ border: 1px solid #ddd; padding: 10px; margin: 5px 0; border-radius: 5px; }}
         .tool-name {{ font-weight: bold; color: #007acc; }}
@@ -231,6 +232,21 @@ def audit_log(action: str, details: dict = None):
         print(f"Failed to write audit log: {e}", file=sys.stderr)
 
 
+# Tools that only read state are safe when READ_ONLY is enabled. Anything not
+# matching these prefixes is blocked (fail-closed), so read-only mode can never
+# move, heat, or otherwise change the printer.
+READ_ONLY_SAFE_PREFIXES = (
+    "get_", "list_", "read_", "check_", "search_", "find_",
+    "analyze_", "parse_", "extract_", "detect_", "diagnose_",
+    "validate_", "capture_", "export_", "dump_",
+)
+
+
+def is_read_only_safe(tool_name: str) -> bool:
+    """Return True if the tool only reads state (safe under READ_ONLY mode)."""
+    return tool_name.startswith(READ_ONLY_SAFE_PREFIXES)
+
+
 # ============================================================
 # Import and register all tools from tool modules
 # ============================================================
@@ -301,7 +317,14 @@ async def handle_call_tool(request: web.Request) -> web.Response:
     
     tool_info = TOOLS[tool_name]
     func = tool_info["function"]
-    
+
+    if config.READ_ONLY and not is_read_only_safe(tool_name):
+        audit_log("blocked_read_only", {"tool": tool_name})
+        return web.json_response({
+            "error": "Server is in READ_ONLY mode; state-changing tools are disabled.",
+            "tool": tool_name
+        }, status=403)
+
     # Log the call
     audit_log("tool_call", {"tool": tool_name, "arguments": arguments})
     
@@ -352,6 +375,7 @@ async def handle_server_info(request: web.Request) -> web.Response:
         "printer": config.PRINTER_NAME,
         "moonraker_url": config.MOONRAKER_URL,
         "armed": config.ARMED,
+        "read_only": config.READ_ONLY,
         "tools_count": len(TOOLS),
         "features": {
             "stealthchanger": True,
@@ -426,6 +450,7 @@ async def handle_server_info_html(request: web.Request) -> web.Response:
             <dt>Printer</dt><dd>{escape(config.PRINTER_NAME)}</dd>
             <dt>Moonraker URL</dt><dd><code>{escape(config.MOONRAKER_URL)}</code></dd>
             <dt>Armed Mode</dt><dd><span class="{"status-ok" if config.ARMED else "status-error"}">{config.ARMED}</span></dd>
+            <dt>Read-Only Mode</dt><dd><span class="{"status-warn" if config.READ_ONLY else "status-ok"}">{config.READ_ONLY}</span></dd>
             <dt>Tools Available</dt><dd>{len(TOOLS)}</dd>
         </dl>
     </section>
@@ -1062,6 +1087,9 @@ async def handle_mcp(request: web.Request) -> web.Response:
             
             if tool_name not in TOOLS:
                 error = {"code": -32601, "message": f"Unknown tool: {tool_name}"}
+            elif config.READ_ONLY and not is_read_only_safe(tool_name):
+                audit_log("blocked_read_only", {"tool": tool_name})
+                error = {"code": -32000, "message": "Server is in READ_ONLY mode; state-changing tools are disabled."}
             else:
                 tool_info = TOOLS[tool_name]
                 func = tool_info["function"]
@@ -1179,6 +1207,7 @@ def main():
     print(f"Printer: {config.PRINTER_NAME}", file=sys.stderr)
     print(f"Moonraker: {config.MOONRAKER_URL}", file=sys.stderr)
     print(f"ARMED: {config.ARMED}", file=sys.stderr)
+    print(f"READ_ONLY: {config.READ_ONLY}", file=sys.stderr)
     print("=" * 50, file=sys.stderr)
     
     app = create_app()

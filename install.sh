@@ -87,10 +87,6 @@ sudo cp "$INSTALL_DIR/klipper-mcp.service" /etc/systemd/system/klipper-mcp.servi
 sudo systemctl daemon-reload
 sudo systemctl enable "$SERVICE_NAME"
 
-# Create log file
-sudo touch /var/log/klipper-mcp.log
-sudo chown "$CURRENT_USER:$CURRENT_USER" /var/log/klipper-mcp.log
-
 echo ""
 echo "=========================================="
 echo "Installation Complete!"
@@ -109,7 +105,7 @@ echo "4. Check service status:"
 echo "   sudo systemctl status $SERVICE_NAME"
 echo ""
 echo "5. View logs:"
-echo "   tail -f /var/log/klipper-mcp.log"
+echo "   journalctl -u $SERVICE_NAME -f"
 echo ""
 echo "MCP server will be available at:"
 echo "   http://$(hostname -I | awk '{print $1}'):${MCP_PORT:-8000}/mcp"
