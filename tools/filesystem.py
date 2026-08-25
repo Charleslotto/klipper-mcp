@@ -2,9 +2,13 @@
 Filesystem Tools
 Read, write, list, upload, and delete files on the printer
 """
+import asyncio
 import json
 import os
 from typing import Optional
+
+import aiohttp
+
 import config
 from moonraker import get_client
 from tools.security import verify_pin
@@ -73,6 +77,57 @@ def _check_path_allowed(root: str, relative_path: str) -> Optional[str]:
             return f"Path '{relative_path}' is outside the allowed '{root}' root"
 
     return None
+
+
+# Per-request ceiling for plain file reads. Deliberately far below the shared
+# session's MOONRAKER_TIMEOUT_SECONDS (which is sized for homing/meshing), so a
+# stalled download surfaces as an error in seconds instead of hanging the caller.
+FILE_READ_TIMEOUT_SECONDS = 30
+FILE_READ_ATTEMPTS = 2
+
+
+async def fetch_file_text(client, root: str, relative_path: str):
+    """
+    Download a file from Moonraker as text.
+
+    Returns (content, error). Exactly one is None.
+
+    Guards against two failure modes seen in practice:
+      * A stale keep-alive socket from the shared ClientSession pool accepts the
+        write and never answers. The session-level timeout is too generous to
+        catch this, so a per-request ClientTimeout is applied here.
+      * Retrying on the same poisoned pool just stalls again, so the session is
+        closed between attempts to force a fresh connector.
+    """
+    url = f"{client.base_url}/server/files/{root}/{relative_path}"
+    timeout = aiohttp.ClientTimeout(total=FILE_READ_TIMEOUT_SECONDS)
+    last_error = None
+
+    for attempt in range(1, FILE_READ_ATTEMPTS + 1):
+        try:
+            session = await client._get_session()
+            async with session.get(url, timeout=timeout) as response:
+                if response.status == 404:
+                    return None, f"File not found: {root}/{relative_path}"
+                response.raise_for_status()
+                # Explicit encoding skips aiohttp's charset sniffing entirely and
+                # keeps a stray byte from raising instead of returning content.
+                return await response.text(encoding="utf-8", errors="replace"), None
+        except asyncio.TimeoutError:
+            last_error = (
+                f"Timed out after {FILE_READ_TIMEOUT_SECONDS}s reading "
+                f"{root}/{relative_path} (attempt {attempt}/{FILE_READ_ATTEMPTS})"
+            )
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        if attempt < FILE_READ_ATTEMPTS:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    return None, last_error
 
 
 async def upload_to_moonraker(client, root: str, relative_path: str, content) -> dict:
@@ -195,7 +250,12 @@ def register_filesystem_tools(mcp):
         return json.dumps({"gcode_files": gcode_files}, indent=2)
     
     @mcp.tool()
-    async def read_file(filepath: str, max_lines: int = 500, root: Optional[str] = None) -> str:
+    async def read_file(
+        filepath: str,
+        max_lines: int = 500,
+        root: Optional[str] = None,
+        start_line: int = 1,
+    ) -> str:
         """
         Read contents of a file from the printer.
 
@@ -207,6 +267,9 @@ def register_filesystem_tools(mcp):
             max_lines: Maximum lines to return (default: 500, to avoid huge responses)
             root: Optional explicit Moonraker root ('config', 'gcodes', 'logs',
                 'timelapse'). Inferred from filepath's leading segment when omitted.
+            start_line: 1-indexed line to begin at (default: 1). Use with max_lines
+                to page through files longer than max_lines. The response reports
+                next_start_line when more content remains.
 
         For G-code files, use get_gcode_metadata instead for analysis.
         """
@@ -218,34 +281,42 @@ def register_filesystem_tools(mcp):
         if disallow_reason:
             return json.dumps({"error": disallow_reason})
 
-        # Use Moonraker's file download endpoint
-        session = await client._get_session()
-        url = f"{client.base_url}/server/files/{resolved_root}/{relative_path}"
+        content, error = await fetch_file_text(client, resolved_root, relative_path)
+        if error:
+            return json.dumps({"error": error})
 
-        try:
-            async with session.get(url) as response:
-                if response.status == 404:
-                    return json.dumps({"error": f"File not found: {resolved_root}/{relative_path}"})
-                response.raise_for_status()
-                content = await response.text()
+        lines = content.split('\n')
+        total_lines = len(lines)
 
-                # Limit lines
-                lines = content.split('\n')
-                if len(lines) > max_lines:
-                    content = '\n'.join(lines[:max_lines])
-                    truncated = True
-                else:
-                    truncated = False
+        begin = max(start_line, 1) - 1
+        if begin >= total_lines:
+            return json.dumps({
+                "filepath": f"{resolved_root}/{relative_path}",
+                "content": "",
+                "lines": 0,
+                "start_line": start_line,
+                "truncated": False,
+                "total_lines": total_lines,
+                "note": f"start_line {start_line} is past end of file ({total_lines} lines)",
+            })
 
-                return json.dumps({
-                    "filepath": f"{resolved_root}/{relative_path}",
-                    "content": content,
-                    "lines": min(len(lines), max_lines),
-                    "truncated": truncated,
-                    "total_lines": len(lines) if truncated else None
-                })
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+        window = lines[begin:begin + max_lines]
+        end = begin + len(window)
+        truncated = end < total_lines
+
+        payload = {
+            "filepath": f"{resolved_root}/{relative_path}",
+            "content": '\n'.join(window),
+            "lines": len(window),
+            "start_line": begin + 1,
+            "end_line": end,
+            "truncated": truncated,
+            "total_lines": total_lines,
+        }
+        if truncated:
+            payload["next_start_line"] = end + 1
+
+        return json.dumps(payload)
     
     @mcp.tool()
     async def write_file(filepath: str, content: str, pin: str, root: Optional[str] = None) -> str:
@@ -406,34 +477,26 @@ def register_filesystem_tools(mcp):
         if disallow_reason:
             return json.dumps({"error": disallow_reason})
 
-        session = await client._get_session()
-        url = f"{client.base_url}/server/files/{resolved_root}/{relative_path}"
+        content, error = await fetch_file_text(client, resolved_root, relative_path)
+        if error:
+            return json.dumps({"error": error})
 
-        try:
-            async with session.get(url) as response:
-                if response.status == 404:
-                    return json.dumps({"error": f"File not found: {resolved_root}/{relative_path}"})
-                response.raise_for_status()
-                content = await response.text()
+        matches = []
+        search_lower = search_term.lower()
 
-                matches = []
-                search_lower = search_term.lower()
+        for i, line in enumerate(content.split('\n'), 1):
+            if search_lower in line.lower():
+                matches.append({
+                    "line_number": i,
+                    "content": line.strip()
+                })
 
-                for i, line in enumerate(content.split('\n'), 1):
-                    if search_lower in line.lower():
-                        matches.append({
-                            "line_number": i,
-                            "content": line.strip()
-                        })
-
-                return json.dumps({
-                    "filepath": f"{resolved_root}/{relative_path}",
-                    "search_term": search_term,
-                    "matches": matches,
-                    "match_count": len(matches)
-                }, indent=2)
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+        return json.dumps({
+            "filepath": f"{resolved_root}/{relative_path}",
+            "search_term": search_term,
+            "matches": matches,
+            "match_count": len(matches)
+        }, indent=2)
 
 
 def format_time(seconds: float) -> str:
