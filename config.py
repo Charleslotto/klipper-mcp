@@ -36,6 +36,9 @@ READ_ONLY = os.getenv("READ_ONLY", "false").lower() == "true"
 # Admin PIN for destructive operations (delete, restore, emergency stop)
 ADMIN_PIN = os.getenv("ADMIN_PIN", "123456")
 
+# Largest G-code file upload_gcode accepts (bytes), from content or a URL
+UPLOAD_MAX_BYTES = int(os.getenv("UPLOAD_MAX_BYTES", str(256 * 1024 * 1024)))
+
 # =============================================================================
 # FILE PATHS
 # Override the base with PRINTER_DATA_PATH or KLIPPER_DATA_DIR for custom setups.
