@@ -60,7 +60,7 @@ This server exposes **100+ tools** for complete printer management, from basic o
 | `list_gcode_files` | Browse G-code files |
 | `get_file_metadata` | Slicer settings, thumbnails |
 | `read_gcode_file` | Read file contents |
-| `upload_gcode_file` | Upload new files |
+| `upload_gcode` | Upload a G-code file from text or an http(s) URL (gcodes/ only, no PIN) |
 | `delete_gcode_file` | Remove files |
 | `search_in_file` | Search file contents |
 | `list_config_files` | Klipper config files |
@@ -243,6 +243,7 @@ nano ~/klipper-mcp/config.py
 | `ARMED` | Enable dangerous operations | `false` |
 | `READ_ONLY` | Hard-block all state-changing tools (overrides `ARMED`) | `false` |
 | `ADMIN_PIN` | PIN for destructive ops | `123456` |
+| `UPLOAD_MAX_BYTES` | Largest file `upload_gcode` accepts | `268435456` (256 MiB) |
 
 **File path settings:**
 | Setting | Description | Default |

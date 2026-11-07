@@ -103,6 +103,40 @@ async def upload_to_moonraker(client, root: str, relative_path: str, content) ->
     return await client.post('/server/files/upload', data=data)
 
 
+GCODE_EXTENSIONS = (".gcode", ".gco", ".g")
+DEFAULT_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
+UPLOAD_DOWNLOAD_TIMEOUT_SECONDS = 300
+
+
+def _upload_max_bytes() -> int:
+    return int(getattr(config, "UPLOAD_MAX_BYTES", DEFAULT_UPLOAD_MAX_BYTES))
+
+
+async def _download(url: str, max_bytes: int) -> bytes:
+    """Download `url` (http/https only) into memory, refusing bodies over `max_bytes`."""
+    import aiohttp
+    from urllib.parse import urlparse
+
+    if urlparse(url).scheme not in ("http", "https"):
+        raise ValueError(f"Only http and https URLs are supported, got {url!r}")
+
+    timeout = aiohttp.ClientTimeout(total=UPLOAD_DOWNLOAD_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as response:
+            if response.status != 200:
+                raise ValueError(f"Download failed: HTTP {response.status} from {url}")
+            if response.content_length is not None and response.content_length > max_bytes:
+                raise ValueError(f"File is {response.content_length} bytes, over the {max_bytes}-byte limit")
+            chunks = []
+            size = 0
+            async for chunk in response.content.iter_chunked(1024 * 1024):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise ValueError(f"File is over the {max_bytes}-byte limit")
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+
 def register_filesystem_tools(mcp):
     """Register filesystem tools."""
     
@@ -290,6 +324,66 @@ def register_filesystem_tools(mcp):
             "message": "File written successfully"
         })
     
+    @mcp.tool()
+    async def upload_gcode(filename: str, content: Optional[str] = None, url: Optional[str] = None) -> str:
+        """
+        Upload a G-code file to the printer's gcodes folder, ready for start_print.
+        Pass exactly one of `content` (the G-code text, for small files) or `url`
+        (an http/https link the printer downloads the file from, for large files).
+        Only .gcode/.gco/.g files under gcodes/ are accepted; an existing file with
+        the same name is replaced. Needs no PIN: it cannot touch config files.
+
+        Args:
+            filename: File name relative to the gcodes folder (e.g. 'toy_house.gcode' or 'parts/house.gcode')
+            content: G-code text to upload
+            url: http(s) URL to download the G-code from
+        """
+        if (content is None) == (url is None):
+            return json.dumps({"error": "Pass exactly one of content or url."})
+
+        relative_path = filename.strip()
+        if relative_path.lower().startswith(("gcodes/", "gcode/")):
+            relative_path = relative_path.split("/", 1)[1]
+        if not relative_path.lower().endswith(GCODE_EXTENSIONS):
+            return json.dumps({"error": f"Only {', '.join(GCODE_EXTENSIONS)} files can be uploaded, got {filename!r}"})
+        if filename.startswith("/"):
+            return json.dumps({"error": f"Invalid or disallowed path: {filename!r}"})
+
+        disallow_reason = _check_path_allowed("gcodes", relative_path)
+        if disallow_reason:
+            return json.dumps({"error": disallow_reason})
+        relative_path = os.path.normpath(relative_path)
+
+        max_bytes = _upload_max_bytes()
+        if url is not None:
+            try:
+                data = await _download(url, max_bytes)
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+        else:
+            data = content
+            if len(content.encode("utf-8")) > max_bytes:
+                return json.dumps({"error": f"Content is over the {max_bytes}-byte limit"})
+
+        size = len(data) if isinstance(data, bytes) else len(data.encode("utf-8"))
+
+        try:
+            result = await upload_to_moonraker(get_client(), "gcodes", relative_path, data)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+        if "error" in result:
+            return json.dumps({"error": result["error"]})
+
+        return json.dumps({
+            "success": True,
+            "filepath": f"gcodes/{relative_path}",
+            "bytes": size,
+            "source": "url" if url is not None else "content",
+            "moonraker_result": result.get("result", result),
+            "message": "G-code uploaded; start it with start_print"
+        })
+
     @mcp.tool()
     async def delete_file(filepath: str, pin: str, root: Optional[str] = None) -> str:
         """
